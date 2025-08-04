@@ -1,0 +1,3 @@
+[submodule "external/virtualgonio"]
+	path = external/virtualgonio
+	url = https://gitlab.xlim.fr/virtualgonio/sources_tog_2019.git
