@@ -4,6 +4,10 @@ project(Dissertation_NDF)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+#----python-------
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+
+
 #----python binding------
 include(FetchContent)
 FetchContent_Declare(
@@ -44,14 +48,43 @@ target_link_libraries(Dissertation_NDF PRIVATE
     SurfaceGenLib
 )
 
-pybind11_add_module(ndf_py src/wrapper.cpp)
+python3_add_library(ndf_py MODULE src/wrapper.cpp)
 
 target_link_libraries(ndf_py PRIVATE
+    pybind11::module
     GonioLib
     SurfaceGenLib
 )
+
 
 set_target_properties(ndf_py PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
+
+# ---- copy .pyd to Python script directory
+add_custom_command(TARGET ndf_py POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:ndf_py>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/python"
+)
+
+
+# ---- generate .pyproj on Windows
+if(WIN32)
+    file(GLOB_RECURSE PYTHON_SCRIPTS RELATIVE ${CMAKE_SOURCE_DIR} src/python/*.py)
+    set(PYTHON_SOURCE_ITEMS "")
+    foreach(PYFILE ${PYTHON_SCRIPTS})
+        set(PYTHON_SOURCE_ITEMS "${PYTHON_SOURCE_ITEMS}    <Compile Include=\"${PYFILE}\" />\n")
+    endforeach()
+
+    set(PYPROJ_OUTPUT "${CMAKE_SOURCE_DIR}/PythonTraining.pyproj")
+
+    configure_file(
+        ${CMAKE_SOURCE_DIR}/cmake/python_project.pyproj.in
+        ${PYPROJ_OUTPUT}
+        @ONLY
+    )
+
+    message(STATUS " Generated Visual Studio Python project: ${PYPROJ_OUTPUT}")
+endif()

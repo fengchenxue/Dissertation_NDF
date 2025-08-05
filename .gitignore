@@ -42,6 +42,9 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
+#cached file
+/PythonTraining.pyproj
+
 # macOS
 .DS_Store
 

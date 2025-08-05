@@ -1,0 +1,20 @@
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ProjectGuid>{5D9A176A-0E1C-4FA6-A55C-123456789ABC}</ProjectGuid>
+    <ProjectHome>.</ProjectHome>
+    <StartupFile>src/python/train_G.py</StartupFile>
+    <SearchPath>.;Lib</SearchPath>
+    <WorkingDirectory>.</WorkingDirectory>
+    <OutputPath>.</OutputPath>
+    <Name>PythonTraining</Name>
+    <RootNamespace>PythonTraining</RootNamespace>
+    <InterpreterPath>${Python3_EXECUTABLE}</InterpreterPath>
+    <InterpreterArguments></InterpreterArguments>
+    <LaunchProvider>Standard Python launcher</LaunchProvider>
+    <EnableNativeCodeDebugging>True</EnableNativeCodeDebugging>
+  </PropertyGroup>
+
+  <ItemGroup>
+@PYTHON_SOURCE_ITEMS@
+  </ItemGroup>
+</Project>
