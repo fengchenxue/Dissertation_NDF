@@ -8,7 +8,7 @@
     <OutputPath>.</OutputPath>
     <Name>PythonTraining</Name>
     <RootNamespace>PythonTraining</RootNamespace>
-    <InterpreterPath>${Python3_EXECUTABLE}</InterpreterPath>
+    <InterpreterPath>@PYTHON_EXECUTABLE_PATH@</InterpreterPath>
     <InterpreterArguments></InterpreterArguments>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
     <EnableNativeCodeDebugging>True</EnableNativeCodeDebugging>
