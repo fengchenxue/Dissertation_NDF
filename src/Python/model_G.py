@@ -1,3 +1,4 @@
+from pyexpat import model
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
@@ -23,6 +24,46 @@ class G1FCNN(nn.Module):
     def forward(self,x):
         return self.net(x)
 
+
+class G1CNN(nn.Module):
+    def __init__(self, input_dim):
+        super(G1CNN, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels=2, out_channels=32, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
+
+        self.fc1 = nn.Linear(2048 + 4, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc_out = nn.Linear(64, 1)
+        
+    def forward(self, x):
+        x_angle = x[:, :4]               
+        x_seq = x[:, 4:].view(-1, 2, 128) 
+        
+       
+        out = self.conv1(x_seq)
+        out = nn.functional.relu(out)
+        out = self.pool(out)    
+        out = self.conv2(out)
+        out = nn.functional.relu(out)
+        out = self.pool(out)      
+        out = self.conv3(out)
+        out = nn.functional.relu(out)
+        out = self.pool(out)      
+        
+        batch_size = out.shape[0]
+        conv_features = out.view(batch_size, -1) 
+        
+        fused = torch.cat([conv_features, x_angle], dim=1)
+        
+        fused = nn.functional.relu(self.fc1(fused))
+        fused = nn.functional.relu(self.fc2(fused))
+        output = self.fc_out(fused)
+        
+        return output
+
+
 class G1Dataset(Dataset):
     def __init__(self,x_data,y_data):
         self.x=torch.tensor(x_data,dtype=torch.float32)
@@ -43,7 +84,7 @@ def G1_train():
     input_dim=260
     
     # data
-    data=np.load("data/dataset/dataset_G_1000.npz")
+    data=np.load("data/dataset/dataset_G_10k.npz")
     x_data= data['x']
     y_data= data['y']
     
@@ -60,6 +101,7 @@ def G1_train():
     # model
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = G1FCNN(input_dim).to(device)
+    #model = G1CNN(input_dim).to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 

@@ -99,6 +99,6 @@ def generate_dataset_G (N=1000, num_control=128):
     return x_data, y_data
 
 if __name__ == "__main__":
-    x_data,y_data=generate_dataset_G(1000, 128)
+    x_data,y_data=generate_dataset_G(10000, 128)
 
-    np.savez_compressed("dataset_G_1000.npz", x=x_data, y=y_data)
+    np.savez_compressed("dataset_G_10000.npz", x=x_data, y=y_data)
