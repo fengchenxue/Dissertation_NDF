@@ -1,10 +1,11 @@
 from pyexpat import model
+from sched import scheduler
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 import torch.nn as nn
-import torch.optim as optim
+import sys, inspect, torch, torch.optim as optim
 import numpy as np
 from sklearn.model_selection import train_test_split
 
@@ -79,37 +80,39 @@ class G1Dataset(Dataset):
 def G1_train():
     #parameters
     batch_size = 256
-    learning_rate = 1e-4
-    epochs=100
+    learning_rate = 1e-3
+    epochs=300
     input_dim=260
-    
+    patience=25 # early stopping patience
+
     # data
-    data=np.load("data/dataset/dataset_G_10k.npz")
+    data=np.load("data/dataset/dataset_G_100k.npz")
     x_data= data['x']
     y_data= data['y']
     
-    x_train, x_test, y_train, y_test = train_test_split(x_data, y_data, test_size=0.2, random_state=42)
+    x_train, x_temp, y_train, y_temp = train_test_split(x_data, y_data, test_size=0.2, random_state=42)
+    x_val,   x_test, y_val,   y_test = train_test_split(x_temp,  y_temp,  test_size=0.5, random_state=42)
 
-    train_dataset = G1Dataset(x_train, y_train)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(G1Dataset(x_train, y_train), batch_size=batch_size, shuffle=True,  pin_memory=True)
+    val_loader   = DataLoader(G1Dataset(x_val,   y_val),   batch_size=batch_size, shuffle=False, pin_memory=True)
+    test_loader  = DataLoader(G1Dataset(x_test,  y_test),  batch_size=batch_size, shuffle=False, pin_memory=True)
 
-    test_dataset = G1Dataset(x_test, y_test)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-
-    
     # model
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = G1FCNN(input_dim).to(device)
-    #model = G1CNN(input_dim).to(device)
+    #model = G1FCNN(input_dim).to(device)
+    model = G1CNN(input_dim).to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6)
 
     #training
+    best_val= float('inf')
+    wait =0
+
     for epoch in range(epochs):
         model.train()
         train_loss=0
-        for x_batch, y_batch in train_dataloader:
+        for x_batch, y_batch in train_loader:
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
 
             optimizer.zero_grad()
@@ -120,26 +123,58 @@ def G1_train():
             
             train_loss += loss.item()*x_batch.size(0)
 
-        avg_train_loss =train_loss / len(train_dataset)
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_train_loss:.6f}")
+        avg_train_loss =train_loss / len(train_loader.dataset)
+        
+        #validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for x_batch, y_batch in val_loader:
+                x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+                outputs = model(x_batch)
+                loss = criterion(outputs, y_batch)
+                val_loss += loss.item() * x_batch.size(0)
 
-    torch.save(model.state_dict(), "data/model/model_G1.pth")
+        avg_val_loss = val_loss / len(val_loader.dataset)
+        scheduler.step(avg_val_loss)
 
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"Epoch [{epoch}/{epochs}]  train={avg_train_loss:.6f}  val={avg_val_loss:.6f}  lr={lr_now:.2e}")
+
+        # Early stopping
+        if avg_val_loss < best_val:
+            best_val = avg_val_loss
+            wait = 0
+            torch.save(model.state_dict(), "data/model/model_G1_best.pth")
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"Early stop at epoch {epoch}")
+                break
+
+    #test
+    model.load_state_dict(torch.load("data/model/model_G1_best.pth", map_location=device))
     model.eval()
+    test_loss_sum = 0.0
     with torch.no_grad():
-        test_loss = 0
-        for x_batch, y_batch in test_dataloader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            outputs = model(x_batch)
-            loss = criterion(outputs, y_batch)
-            test_loss += loss.item() * x_batch.size(0)
-        avg_loss = test_loss / len(test_dataset)
-        print(f"Test Loss: {avg_loss:.6f}")
+        for xb, yb in test_loader:
+            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            test_loss_sum += loss.item() * xb.size(0)
+    avg_test = test_loss_sum / len(test_loader.dataset)
+    print(f"Test Loss: {avg_test:.6f}")
 
     return
 
 
 def test_environment():
+    print("Python:", sys.version)
+    print("Torch:", torch.__version__)
+    print("optim.lr_scheduler file:", inspect.getfile(optim.lr_scheduler))
+    print("ReduceLROnPlateau signature:",inspect.signature(optim.lr_scheduler.ReduceLROnPlateau.__init__))
+    print("Torch module file:", torch.__file__)
+
     # Check if PyTorch is installed and working
     print("PyTorch version:", torch.__version__)
     print("CUDA available:", torch.cuda.is_available())
@@ -150,5 +185,7 @@ def test_environment():
         print("No CUDA-capable device detected.")
 
 
+
 if __name__ == "__main__":
     G1_train()
+    #test_environment()
