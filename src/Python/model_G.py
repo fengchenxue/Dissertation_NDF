@@ -64,6 +64,109 @@ class G1CNN(nn.Module):
         
         return output
 
+class G1CNN_GAP(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels=2, out_channels=32, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.gap = nn.AdaptiveAvgPool1d(1)
+
+        self.fc1 = nn.Linear(128 + 4, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc_out = nn.Linear(64, 1)
+        
+    def forward(self, x):
+        x_angle = x[:, :4]               
+        x_seq = x[:, 4:].view(-1, 2, 128) 
+        
+       
+        out = self.conv1(x_seq)
+        out = nn.functional.relu(out)
+        out = self.pool(out)    
+        out = self.conv2(out)
+        out = nn.functional.relu(out)
+        out = self.pool(out)      
+        out = self.conv3(out)
+        out = nn.functional.relu(out)
+        out = self.pool(out)      
+        
+        #batch_size = out.shape[0]
+        #conv_features = out.view(batch_size, -1) 
+
+        out = self.gap(out).squeeze(-1)
+
+        #fused = torch.cat([conv_features, x_angle], dim=1)
+        fused = torch.cat([out, x_angle], dim=1)
+
+        fused = nn.functional.relu(self.fc1(fused))
+        fused = nn.functional.relu(self.fc2(fused))
+        output = self.fc_out(fused)
+        
+        return output
+
+
+
+class G1CNN_GAP_S(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels=2,   out_channels=32,  kernel_size=5, padding=2, stride=2)  # 128 -> 64
+        self.conv2 = nn.Conv1d(in_channels=32,  out_channels=64,  kernel_size=5, padding=2, stride=2)  # 64  -> 32
+        self.conv3 = nn.Conv1d(in_channels=64,  out_channels=128, kernel_size=3, padding=1, stride=1)  # 32  -> 32
+        # self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.gap   = nn.AdaptiveAvgPool1d(1)
+
+        self.fc1   = nn.Linear(128 + 4, 128)
+        self.fc2   = nn.Linear(128, 64)
+        self.fc_out= nn.Linear(64, 1)
+
+    def forward(self, x):
+        x_angle = x[:, :4]
+        x_seq   = x[:, 4:].view(-1, 2, 128)
+
+        out = torch.relu(self.conv1(x_seq))   # 2x128 -> 32x64
+        out = torch.relu(self.conv2(out))     # 32x64 -> 64x32
+        out = torch.relu(self.conv3(out))     # 64x32 -> 128x32
+
+        out = self.gap(out).squeeze(-1)
+        fused = torch.cat([out, x_angle], dim=1)
+        fused = torch.relu(self.fc1(fused))
+        fused = torch.relu(self.fc2(fused))
+        return self.fc_out(fused)
+
+class DWConv1d(nn.Sequential):
+    def __init__(self, in_ch, out_ch, k, stride=1, padding=None):
+        if padding is None: padding = (k - 1) // 2
+        super().__init__(
+            nn.Conv1d(in_ch, in_ch, k, stride=stride, padding=padding,
+                      groups=in_ch, bias=False),   # Depthwise
+            nn.Conv1d(in_ch, out_ch, 1, bias=False),   # Pointwise
+            nn.ReLU(inplace=True),
+        )
+
+class G1CNN_GAP_DW(nn.Module):
+    def __init__(self, input_dim=260):
+        super().__init__()
+        self.conv1 = nn.Conv1d(2,   32, 5, padding=2, stride=2)     # 128->64
+        self.conv2 = DWConv1d(32,  64, 5, stride=2)                 # 64 ->32 (DW+PW)
+        self.conv3 = nn.Conv1d(64, 128, 3, padding=1, stride=1)     # 32 ->32
+        self.gap   = nn.AdaptiveAvgPool1d(1)
+        self.fc1   = nn.Linear(128 + 4, 128)
+        self.fc2   = nn.Linear(128, 64)
+        self.fc_out= nn.Linear(64, 1)
+    def forward(self, x):
+        x_angle = x[:, :4]
+        x_seq   = x[:, 4:].view(-1, 2, 128)
+        out = torch.relu(self.conv1(x_seq))
+        out = self.conv2(out)
+        out = torch.relu(self.conv3(out))
+        out = self.gap(out).squeeze(-1)
+        fused = torch.cat([out, x_angle], dim=1)
+        fused = torch.relu(self.fc1(fused))
+        fused = torch.relu(self.fc2(fused))
+        return self.fc_out(fused)
+
 
 class G1Dataset(Dataset):
     def __init__(self,x_data,y_data):
@@ -100,7 +203,10 @@ def G1_train():
     # model
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     #model = G1FCNN(input_dim).to(device)
-    model = G1CNN(input_dim).to(device)
+    #model = G1CNN(input_dim).to(device)
+    #model = G1CNN_GAP(input_dim).to(device)
+    #model = G1CNN_GAP_S(input_dim).to(device)
+    model = G1CNN_GAP_DW(input_dim).to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6)

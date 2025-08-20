@@ -44,6 +44,7 @@ Desktop.ini
 
 #cached file
 /PythonTraining.pyproj
+__pycache__/
 
 # macOS
 .DS_Store
