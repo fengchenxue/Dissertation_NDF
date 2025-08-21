@@ -143,7 +143,6 @@ def pretty_print_split(title, device, params, results):
         print(f"             FWD    mean={fwd['mean_ms']:8.3f} ms  p50={fwd['p50_ms']:8.3f} ms  p95={fwd['p95_ms']:8.3f} ms")
 
 def main():
-    # 小贴士：单线程更稳定的 CPU 延迟；吞吐另测多线程
     # import os
     # torch.set_num_threads(1); os.environ["OMP_NUM_THREADS"]="1"; os.environ["MKL_NUM_THREADS"]="1"
 
