@@ -6,6 +6,10 @@ import os, time, statistics
 import math
 from sklearn.model_selection import train_test_split
 
+torch.set_num_threads(1)
+os.environ["OMP_NUM_THREADS"]="1"
+os.environ["MKL_NUM_THREADS"]="1"
+
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
@@ -164,6 +168,72 @@ def build_sample_source_from_test(x_te):
         return X_cpu[idx]
     return sample
 
+def _agg_scalar_list(vals):
+    import math
+    if len(vals) == 0:
+        return {"mean": float("nan"), "std": float("nan"), "n": 0}
+    m = float(np.mean(vals)); s = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+    return {"mean": m, "std": s, "n": len(vals)}
+
+def aggregate_bench_results(per_seed_results):
+    '''
+    per_seed_results: List[Dict[bs -> stats or split_stats]]
+      - non split: stats = {"mean_ms","p50_ms","p95_ms"}
+      - split:    split_stats = {"h2d":stats, "fwd":stats, "total":stats}
+    '''
+    agg = {}
+    all_bs = set()
+    for R in per_seed_results:
+        all_bs.update(R.keys())
+    for bs in sorted(all_bs):
+        # check if need to spilt
+        any_stats = next((R[bs] for R in per_seed_results if bs in R), None)
+        if isinstance(any_stats, dict) and "mean_ms" in any_stats:  # non split
+            fields = {"mean_ms": [], "p50_ms": [], "p95_ms": []}
+            for R in per_seed_results:
+                if bs in R:
+                    st = R[bs]
+                    for k in fields.keys():
+                        fields[k].append(st[k])
+            agg[bs] = {k: _agg_scalar_list(v) for k, v in fields.items()}
+           
+            tput_list = [ bs / (ms/1000.0) for ms in fields["mean_ms"] ]
+            agg[bs]["throughput"] = _agg_scalar_list(tput_list)
+        else:  # split
+            agg[bs] = {}
+            for part in ("h2d","fwd","total"):
+                fields = {"mean_ms": [], "p50_ms": [], "p95_ms": []}
+                for R in per_seed_results:
+                    if bs in R:
+                        st = R[bs][part]
+                        for k in fields.keys():
+                            fields[k].append(st[k])
+                agg[bs][part] = {k: _agg_scalar_list(v) for k, v in fields.items()}
+            
+            tput_list = [ bs / (ms/1000.0) for ms in [x["mean_ms"] for x in [R[bs]["total"] for R in per_seed_results if bs in R]] ]
+            agg[bs]["throughput"] = _agg_scalar_list(tput_list)
+    return agg
+
+def pretty_print_agg(title, device, params, agg):
+    print("="*80)
+    print(f"{title} | device={device.type} | params={params/1e6:.3f} M")
+    for bs, stats in agg.items():
+        if "mean_ms" in stats:  # non split
+            m = stats["mean_ms"]; p50 = stats["p50_ms"]; p95 = stats["p95_ms"]; tp = stats["throughput"]
+            print(f"  batch={bs:4d}  mean={m['mean']:8.3f}¡À{m['std']:6.3f} ms "
+                  f" p50={p50['mean']:8.3f}¡À{p50['std']:6.3f}  p95={p95['mean']:8.3f}¡À{p95['std']:6.3f} "
+                  f" throughput={tp['mean']:8.1f}¡À{tp['std']:6.1f} /s  (n={m['n']})")
+        else:  # split
+            tot = stats["total"]; h2d = stats["h2d"]; fwd = stats["fwd"]; tp = stats["throughput"]
+            print(f"  batch={bs:4d}  TOTAL  mean={tot['mean_ms']['mean']:8.3f}¡À{tot['mean_ms']['std']:6.3f} ms"
+                  f"  p50={tot['p50_ms']['mean']:8.3f}¡À{tot['p50_ms']['std']:6.3f}"
+                  f"  p95={tot['p95_ms']['mean']:8.3f}¡À{tot['p95_ms']['std']:6.3f}  throughput={tp['mean']:8.1f}¡À{tp['std']:6.1f}/s")
+            print(f"             H2D    mean={h2d['mean_ms']['mean']:8.3f}¡À{h2d['mean_ms']['std']:6.3f}  "
+                  f"p50={h2d['p50_ms']['mean']:8.3f}¡À{h2d['p50_ms']['std']:6.3f}  "
+                  f"p95={h2d['p95_ms']['mean']:8.3f}¡À{h2d['p95_ms']['std']:6.3f}")
+            print(f"             FWD    mean={fwd['mean_ms']['mean']:8.3f}¡À{fwd['mean_ms']['std']:6.3f}  "
+                  f"p50={fwd['p50_ms']['mean']:8.3f}¡À{fwd['p50_ms']['std']:6.3f}  "
+                  f"p95={fwd['p95_ms']['mean']:8.3f}¡À{fwd['p95_ms']['std']:6.3f}")
 def pretty_print(title, device, params, results):
     print("="*80)
     print(f"{title} | device={device.type} | params={params/1e6:.3f} M")
@@ -191,50 +261,146 @@ def main():
     npz_path = "data/dataset/dataset_G_100k.npz"   
     te_loader, (x_te, y_te) = make_loaders_from_npz(npz_path, batch=2048, seed=42)
     sample_source = build_sample_source_from_test(x_te)
+    
+    SEEDS = [0,1,2,3,4]
 
-
-    MODELS = [
-        ("FCNN",        lambda: model_G.G1FCNN(260),               "data/model/model_G1_FCNN_100K.pth"),
-        ("Encoder_4",   lambda: model_G.build_model(z_dim=4, head_hidden=(128,64), act="relu", dropout=0.0),"data/model/model_G1_z4_100K.pth"),
+    MODEL_SPECS = [
+        ("FCNN",        lambda: model_G.G1FCNN(260)),              
+        ("CNN",         lambda: model_G.G1CNN(260)),               
+        ("CNN_GAP",     lambda: model_G.G1CNN_GAP(260)),           
+        ("CNN_GAP_S",   lambda: model_G.G1CNN_GAP_S(260)),
+        ("CNN_GAP_DW",  lambda: model_G.G1CNN_GAP_DW(260, width_mult=1.0)),
+        ("CNN_GAP_DW_Wide", lambda: model_G.G1CNN_GAP_DW(260, width_mult=2.0)),
     ]
 
-    for name, ctor, ckpt in MODELS:
-        # ---------------- accuracy (TEST)----------------
-        m = ctor().to(device_cpu).eval()
-        if os.path.exists(ckpt):
-            m.load_state_dict(torch.load(ckpt, map_location="cpu"))
-        params = count_params(m)
-        metrics = eval_metrics_on_loader(m.to(device_cpu), te_loader, device_cpu)
-        print(f"[TEST][{name}] MAE={metrics['MAE']:.8f}  RMSE={metrics['RMSE']:.8f}  "
-              f"P95={metrics['P95']:.8f}  HighThetaMAE={metrics['HighThetaMAE']:.8f}  "
-              f"Params={params/1e6:.4f}M")
+    MODEL_SPECS += [
+        (f"Encoder_{z}", lambda z=z: model_G.build_model(
+            z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0))
+        for z in [64,32,16,8,4,2,1,0]
+    ]
+    # ====== evaluation ======
+    results_table = []  
+    for name, ctor in MODEL_SPECS:
 
-        # ---------------- speed (CPU) ----------------
-        r_cpu = run_benchmark(m.to(device_cpu), device_cpu,
+        ckpts = []
+        for s in SEEDS:
+            p = os.path.join("data", "model", f"{name}_s{s}_best.pth")
+            if os.path.exists(p):
+                ckpts.append((s, p))
+        if not ckpts:
+            print(f"[SKIP] {name}: no ckpt found (expect data/model/{name}_sX_best.pth)")
+            continue
+
+        # ¡ª¡ª accuracy¡ª¡ª
+        maes, rmses, p95s, hi_maes = [], [], [], []
+        params_ref = None
+        for s, p in ckpts:
+            m = ctor().to(device_cpu).eval()
+            sd = torch.load(p, map_location="cpu")
+            m.load_state_dict(sd, strict=True)
+            if params_ref is None:
+                params_ref = count_params(m)
+
+            metrics = eval_metrics_on_loader(m, te_loader, device_cpu)  # MAE/RMSE/P95/HighThetaMAE
+            maes.append(metrics["MAE"]); rmses.append(metrics["RMSE"])
+            p95s.append(metrics["P95"]);  hi_maes.append(metrics["HighThetaMAE"])
+
+            print(f"[TEST][{name}][seed={s}] "
+                  f"MAE={metrics['MAE']:.8f}  RMSE={metrics['RMSE']:.8f}  "
+                  f"P95={metrics['P95']:.8f}  HighThetaMAE={metrics['HighThetaMAE']:.8f}")
+
+        # mean and std
+        import statistics
+        def mstd(x):  # ·µ»Ø (mean, std)
+            return (float(statistics.mean(x)), float(statistics.pstdev(x)) if len(x)>1 else 0.0)
+
+        mae_m, mae_s   = mstd(maes)
+        rmse_m, rmse_s = mstd(rmses)
+        p95_m, p95_s   = mstd(p95s)
+        htm_m, htm_s   = mstd(hi_maes)
+
+        print(f"[AGG][{name}] seeds={len(ckpts)}  "
+              f"MAE={mae_m:.8f}¡À{mae_s:.8f}  RMSE={rmse_m:.8f}¡À{rmse_s:.8f}  "
+              f"P95={p95_m:.8f}¡À{p95_s:.8f}  High¦¨={htm_m:.8f}¡À{htm_s:.8f}  "
+              f"Params={params_ref/1e6:.3f}M")
+
+        results_table.append((name, len(ckpts), mae_m, mae_s, rmse_m, rmse_s, p95_m, p95_s, htm_m, htm_s, params_ref))
+
+        # ¡ª¡ª speed ¡ª¡ª
+        # CPU
+        cpu_runs = []
+        params_ref = None
+        for s, p in ckpts:
+            m = ctor().to(device_cpu).eval()
+            sd = torch.load(p, map_location="cpu")
+            m.load_state_dict(sd, strict=True)
+            if params_ref is None: params_ref = count_params(m)
+            r = run_benchmark(m, device_cpu,
                               batch_sizes=(1, 2048), repeats=200, warmup=50,
-                              measure="device_only", use_amp=False, sample_source=sample_source)
-        pretty_print(f"{name} | CPU device-only fp32", device_cpu, params, r_cpu)
+                              measure="device_only", use_amp=False,
+                              sample_source=sample_source)
+            cpu_runs.append(r)
+        cpu_agg = aggregate_bench_results(cpu_runs)
+        pretty_print_agg(f"{name} | CPU device-only fp32 (5 seeds)", device_cpu, params_ref, cpu_agg)
 
-        # ---------------- speed (GPU) ----------------
+        # CPU split
+        cpu_split_runs = []
+        for s, p in ckpts:
+            m = ctor().to(device_cpu).eval()
+            m.load_state_dict(torch.load(p, map_location="cpu"))
+            r = run_benchmark(m, device_cpu,
+                              batch_sizes=(1,), repeats=200, warmup=50,
+                              measure="split", use_amp=False,
+                              sample_source=sample_source)
+            cpu_split_runs.append(r)
+        cpu_split_agg = aggregate_bench_results(cpu_split_runs)
+        pretty_print_agg(f"{name} | CPU split fp32 (5 seeds)", device_cpu, params_ref, cpu_split_agg)
+
+        # GPU
         if device_gpu is not None:
-            mg = ctor().to(device_gpu).eval()
-            if os.path.exists(ckpt):
-                mg.load_state_dict(torch.load(ckpt, map_location=device_gpu))
-            params_g = count_params(mg)
-            r_gpu = run_benchmark(mg, device_gpu,
+            gpu_runs = []
+            for s, p in ckpts:
+                mg = ctor().to(device_gpu).eval()
+                mg.load_state_dict(torch.load(p, map_location=device_gpu))
+                r = run_benchmark(mg, device_gpu,
                                   batch_sizes=(1, 1024), repeats=300, warmup=80,
-                                  measure="device_only", use_amp=False, sample_source=sample_source)
-            pretty_print(f"{name} | GPU device-only fp32", device_gpu, params_g, r_gpu)
+                                  measure="device_only", use_amp=False,
+                                  sample_source=sample_source)
+                gpu_runs.append(r)
+            gpu_agg = aggregate_bench_results(gpu_runs)
+            pretty_print_agg(f"{name} | GPU device-only fp32 (5 seeds)", device_gpu, params_ref, gpu_agg)
 
-            r_gpu_amp = run_benchmark(mg, device_gpu,
-                                      batch_sizes=(1, 1024), repeats=300, warmup=80,
-                                      measure="device_only", use_amp=True, sample_source=sample_source)
-            pretty_print(f"{name} | GPU device-only AMP(fp16)", device_gpu, params_g, r_gpu_amp)
+            # AMP(fp16)
+            gpu_amp_runs = []
+            for s, p in ckpts:
+                mg = ctor().to(device_gpu).eval()
+                mg.load_state_dict(torch.load(p, map_location=device_gpu))
+                r = run_benchmark(mg, device_gpu,
+                                  batch_sizes=(1, 1024), repeats=300, warmup=80,
+                                  measure="device_only", use_amp=True,
+                                  sample_source=sample_source)
+                gpu_amp_runs.append(r)
+            gpu_amp_agg = aggregate_bench_results(gpu_amp_runs)
+            pretty_print_agg(f"{name} | GPU device-only AMP(fp16) (5 seeds)", device_gpu, params_ref, gpu_amp_agg)
 
-            r_split = run_benchmark(mg, device_gpu,
-                                    batch_sizes=(1,), repeats=400, warmup=100,
-                                    measure="split", use_amp=False, sample_source=sample_source)
-            pretty_print_split(f"{name} | GPU split(fp32, bs=1)", device_gpu, params_g, r_split)
+            # GPU split
+            gpu_split_runs = []
+            for s, p in ckpts:
+                mg = ctor().to(device_gpu).eval()
+                mg.load_state_dict(torch.load(p, map_location=device_gpu))
+                r = run_benchmark(mg, device_gpu,
+                                  batch_sizes=(1,), repeats=400, warmup=100,
+                                  measure="split", use_amp=False,
+                                  sample_source=sample_source)
+                gpu_split_runs.append(r)
+            gpu_split_agg = aggregate_bench_results(gpu_split_runs)
+            pretty_print_agg(f"{name} | GPU split fp32 (5 seeds)", device_gpu, params_ref, gpu_split_agg)
+
+
+    print("\n" + "="*80)
+    print("Name, Nseeds, MAE_mean, MAE_std, RMSE_mean, RMSE_std, P95_mean, P95_std, HighThetaMAE_mean, HighThetaMAE_std, Params")
+    for row in results_table:
+        print(", ".join([row[0], str(row[1])] + [f"{v:.6g}" if isinstance(v, float) else str(v) for v in row[2:]]))
 
 
 

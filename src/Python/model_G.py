@@ -7,6 +7,9 @@ import inspect
 import torch.optim as optim
 import numpy as np
 from sklearn.model_selection import train_test_split
+import os, csv, time
+import torch.nn.functional as F
+import random
 
 class G1FCNN(nn.Module):
     def __init__(self,input_dim):
@@ -207,12 +210,11 @@ class G1Head(nn.Module):
               
           self.mlp = nn.Sequential(*layers) if layers else nn.Identity()
           self.out = nn.Linear(last, 1)
-          self.out_act = nn.Sigmoid()
 
     def forward(self, z, angle):           # z:(B,z_dim), angle:(B,angle_dim)
         x = torch.cat([z, angle], dim=1)
         x = self.mlp(x)
-        return self.out_act(self.out(x))
+        return self.out(x)
 
 class _ZeroFeat(nn.Module):
     def forward(self, z):  # z:(B,128)
@@ -410,8 +412,160 @@ def test_environment():
     else:
         print("No CUDA-capable device detected.")
 
+#-------------auto train models-------------
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def make_loaders(npz_path="data/dataset/dataset_G_100k.npz", batch_size=2048, split_seed=42):
+    data = np.load(npz_path)
+    x, y = data["x"], data["y"]
+
+    x_tr, x_tmp, y_tr, y_tmp = train_test_split(x, y, test_size=0.2, random_state=split_seed)
+    x_va, x_te, y_va, y_te = train_test_split(x_tmp, y_tmp, test_size=0.5, random_state=split_seed)
+    train_loader = DataLoader(G1Dataset(x_tr, y_tr), batch_size=batch_size, shuffle=True,  pin_memory=True)
+    val_loader   = DataLoader(G1Dataset(x_va, y_va), batch_size=batch_size, shuffle=False, pin_memory=True)
+    test_loader  = DataLoader(G1Dataset(x_te, y_te), batch_size=batch_size, shuffle=False, pin_memory=True)
+    return train_loader, val_loader, test_loader
+
+@torch.inference_mode()
+def eval_mse_on(loader, model, device):
+    model.eval()
+    s, n = 0.0, 0
+    for xb, yb in loader:
+        xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+        pred = model(xb)
+        s += F.mse_loss(pred, yb, reduction="sum").item()
+        n += yb.numel()
+    return s / max(1, n)
+
+def train_once(model, loaders, *, tag, seed=0, train_mode="full",
+               lr=1e-3, epochs=500, patience=25,
+               enc_ckpt=None, out_dir="data/model"):
+
+    set_seed(seed)
+    os.makedirs(out_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+
+    if train_mode == "head":
+        if enc_ckpt and os.path.exists(enc_ckpt):
+            full_sd = torch.load(enc_ckpt, map_location=device)
+            enc_sd = {k.replace("enc.", ""): v for k, v in full_sd.items() if k.startswith("enc.")}
+            model.enc.load_state_dict(enc_sd, strict=False)
+        for p in model.enc.parameters():
+            p.requires_grad = False
+        model.enc.eval()
+        optimizer = torch.optim.Adam(model.head.parameters(), lr=lr)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6)
+    criterion = torch.nn.MSELoss()
+
+    train_loader, val_loader, test_loader = loaders
+    best_val = float("inf"); wait = 0
+    ckpt_path = os.path.join(out_dir, f"{tag}_s{seed}_best.pth")
+    t0 = time.time()
+
+    for epoch in range(epochs):
+        model.train()
+        if train_mode == "head":
+            model.enc.eval() 
+        tr_sum, ntr = 0.0, 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            optimizer.zero_grad()
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            loss.backward()
+            optimizer.step()
+            tr_sum += loss.item() * yb.numel()
+            ntr += yb.numel()
+        avg_tr = tr_sum / max(1, ntr)
+
+        val_mse = eval_mse_on(val_loader, model, device)
+        scheduler.step(val_mse)
+        print(f"[{tag}|seed={seed}] ep={epoch:03d}  train={avg_tr:.8f}  val={val_mse:.8f}  lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        if val_mse < best_val - 1e-12:
+            best_val, wait = val_mse, 0
+            torch.save(model.state_dict(), ckpt_path)
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"[{tag}|seed={seed}] early stop at ep {epoch}")
+                break
+
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    test_mse = eval_mse_on(test_loader, model, device)
+    minutes = (time.time() - t0) / 60.0
+    print(f"[{tag}|seed={seed}] Test MSE={test_mse:.8f}  time={minutes:.1f} min  -> {ckpt_path}")
+    return {"tag": tag, "seed": seed, "val_mse": best_val, "test_mse": test_mse, "minutes": minutes, "ckpt": ckpt_path}
+
+def run_all_experiments():
+    input_dim = 260
+    seeds = [0, 1, 2, 3, 4]
+
+    # 1) model list
+    exp_list = [
+        ("FCNN",        lambda: G1FCNN(input_dim),                         "full", None),
+        ("CNN",         lambda: G1CNN(input_dim),                          "full", None),
+        ("CNN_GAP",     lambda: G1CNN_GAP(input_dim),                      "full", None),
+        ("CNN_GAP_S",   lambda: G1CNN_GAP_S(input_dim),                    "full", None),
+        ("CNN_GAP_DW",      lambda: G1CNN_GAP_DW(input_dim, width_mult=1.0), "full", None),
+        ("CNN_GAP_DW_Wide", lambda: G1CNN_GAP_DW(input_dim, width_mult=2.0), "full", None),
+    ]
+    for z in [64, 32, 16, 8, 4, 2, 1, 0]:
+        exp_list.append((
+            f"Encoder_{z}",
+            lambda z=z: build_model(z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0),
+            "full", None
+        ))
+
+    # 2. CSV
+    os.makedirs("data/model", exist_ok=True)
+    csv_runs = "data/model/summary_runs.csv"
+    csv_agg  = "data/model/summary_agg.csv"
+
+    agg = {}  # tag -> list of test_mse
+    with open(csv_runs, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["tag","seed","val_mse","test_mse","minutes","ckpt"])
+        w.writeheader()
+
+        # 3. train
+        for tag, ctor, mode, enc_ckpt in exp_list:
+            agg[tag] = []
+            for s in seeds:
+                print(f"\n===== [RUN] {tag}  mode={mode}  seed={s} =====")
+                set_seed(s) 
+                loaders = make_loaders(npz_path="data/dataset/dataset_G_100k.npz",
+                                       batch_size=2048, split_seed=42)
+                info = train_once(ctor(), loaders, tag=tag, seed=s, train_mode=mode,
+                                  lr=1e-3, epochs=500, patience=25, enc_ckpt=enc_ckpt,
+                                  out_dir="data/model")
+                w.writerow(info); f.flush()
+                agg[tag].append(info["test_mse"])
+
+    # 4. mean and std
+    with open(csv_agg, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["tag","mean_test_mse","std_test_mse","n"])
+        w.writeheader()
+        for tag, arr in agg.items():
+            arr = np.array(arr, dtype=np.float64)
+            std = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+            w.writerow({"tag": tag, "mean_test_mse": float(arr.mean()), "std_test_mse": std, "n": int(arr.size)})
+
+    print(f"\nAll done.\n - Per-run  -> {csv_runs}\n - Aggregate-> {csv_agg}")
 
 
 if __name__ == "__main__":
-    G1_train()
+    #G1_train()
     #test_environment()
+    run_all_experiments()
