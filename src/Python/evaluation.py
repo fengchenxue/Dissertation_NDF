@@ -10,6 +10,102 @@ torch.set_num_threads(1)
 os.environ["OMP_NUM_THREADS"]="1"
 os.environ["MKL_NUM_THREADS"]="1"
 
+#---------head-only benchmark tools---------
+class _HeadOnly(nn.Module):
+    def __init__(self, head: nn.Module, angle_dim=4):
+        super().__init__()
+        self.head = head
+        self.angle_dim = angle_dim
+    def forward(self, az):  # az:(B, 4+z)
+        angle = az[:, :self.angle_dim]
+        z     = az[:, self.angle_dim:]
+        return self.head(z, angle)
+
+@torch.inference_mode()
+def build_head_only_from_ckpt(ckpt_path: str, z_dim: int, angle_dim=4):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    full = model_G.build_model(z_dim=z_dim, head_hidden=(128,64), act="relu", dropout=0.0)
+    full.load_state_dict(torch.load(ckpt_path, map_location=dev), strict=True)
+    head = full.head.to(dev).eval()
+    return _HeadOnly(head, angle_dim=angle_dim).to(dev).eval()
+
+@torch.inference_mode()
+def precompute_z_cache(ckpt_path: str, z_dim: int, x_te: np.ndarray, y_te: np.ndarray,
+                       out_path: str, angle_dim: int = 4, batch: int = 4096):
+    #save to npz: z, angles, y
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    m = model_G.build_model(z_dim=z_dim, head_hidden=(128,64), act="relu", dropout=0.0).to(dev).eval()
+    m.load_state_dict(torch.load(ckpt_path, map_location=dev), strict=True)
+
+    X_cpu = torch.from_numpy(x_te.astype(np.float32))
+    Y_cpu = torch.from_numpy(y_te.astype(np.float32)).view(-1,1)
+    if torch.cuda.is_available(): X_cpu = X_cpu.pin_memory(); Y_cpu = Y_cpu.pin_memory()
+
+    Z_list, ANG_list = [], []
+    for i in range(0, X_cpu.size(0), batch):
+        xb = X_cpu[i:i+batch].to(dev, non_blocking=True)
+        angle = xb[:, :angle_dim].detach().cpu().numpy()
+        seq   = xb[:, angle_dim:].view(-1, 2, 128)
+        z     = m.enc(seq).detach().cpu().numpy()
+        Z_list.append(z); ANG_list.append(angle)
+    Z   = np.concatenate(Z_list, 0).astype(np.float32)
+    ANG = np.concatenate(ANG_list, 0).astype(np.float32)
+    np.savez_compressed(out_path, z=Z, angles=ANG, y=y_te.astype(np.float32))
+    print(f"[z-cache] saved -> {out_path}  z.shape={Z.shape}  angles.shape={ANG.shape}  y.shape={y_te.shape}")
+
+def make_head_sample_source(z_cache_path: str):
+    data = np.load(z_cache_path)
+    ANG = torch.from_numpy(data["angles"].astype(np.float32))
+    Z   = torch.from_numpy(data["z"].astype(np.float32))
+    N   = ANG.size(0)
+    gen = torch.Generator(device="cpu").manual_seed(0)
+    if torch.cuda.is_available(): ANG = ANG.pin_memory(); Z = Z.pin_memory()
+    def sample(bs: int) -> torch.Tensor:
+        idx = torch.randint(0, N, (bs,), generator=gen)
+        return torch.cat([ANG[idx], Z[idx]], dim=1)   # (bs, 4+z)
+    return sample
+
+@torch.inference_mode()
+def eval_headonly_metrics(head_model: nn.Module, z_cache_path: str):
+    data = np.load(z_cache_path)
+    ANG = torch.from_numpy(data["angles"].astype(np.float32))
+    Z   = torch.from_numpy(data["z"].astype(np.float32))
+    Y   = torch.from_numpy(data["y"].astype(np.float32)).view(-1,1)
+    X   = torch.cat([ANG, Z], dim=1)
+
+    dev = next(head_model.parameters()).device
+    bs  = 4096
+    mae_sum = mse_sum = 0.0; n = 0
+    abs_errs = []; hi_mae_sum = 0.0; hi_cnt = 0
+
+    for i in range(0, X.size(0), bs):
+        xb = X[i:i+bs].to(dev, non_blocking=True)
+        yb = Y[i:i+bs].to(dev, non_blocking=True)
+        pred = head_model(xb)
+        err  = (pred - yb).view(-1)
+        ae   = err.abs()
+        mae_sum += ae.sum().item()
+        mse_sum += (err*err).sum().item()
+        n += ae.numel()
+        abs_errs.append(ae.detach().cpu())
+
+        # high-theta
+        cos_t = xb[:, 0].clamp(-1,1).detach().cpu()
+        sin_t = xb[:, 1].clamp(-1,1).detach().cpu()
+        theta = torch.atan2(sin_t, cos_t)
+        mask  = theta >= 1.2
+        if mask.any():
+            hi_mae_sum += ae.detach().cpu()[mask].sum().item()
+            hi_cnt     += int(mask.sum().item())
+
+    mae  = mae_sum / max(1,n)
+    rmse = float(math.sqrt(mse_sum / max(1,n)))
+    abs_all = torch.cat(abs_errs) if len(abs_errs) else torch.tensor([])
+    p95  = torch.quantile(abs_all, 0.95).item() if abs_all.numel() else float("nan")
+    hi_mae = (hi_mae_sum / hi_cnt) if hi_cnt>0 else float("nan")
+    return {"MAE": mae, "RMSE": rmse, "P95": p95, "HighThetaMAE": hi_mae, "N": n}
+
+#---------all-model benchmark tools---------
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
@@ -136,7 +232,7 @@ def eval_metrics_on_loader(model, loader, device, high_theta_threshold=1.2):
         mse_sum += (err * err).sum().item()
         n += ae.numel()
         abs_errs.append(ae.cpu())
-        # high ¦È£º¦È = atan2(sin¦È, cos¦È)
+        
         cos_t = xb[:, 0].clamp(-1, 1); sin_t = xb[:, 1].clamp(-1, 1)
         theta = torch.atan2(sin_t, cos_t)
         mask = theta >= high_theta_threshold
@@ -220,20 +316,20 @@ def pretty_print_agg(title, device, params, agg):
     for bs, stats in agg.items():
         if "mean_ms" in stats:  # non split
             m = stats["mean_ms"]; p50 = stats["p50_ms"]; p95 = stats["p95_ms"]; tp = stats["throughput"]
-            print(f"  batch={bs:4d}  mean={m['mean']:8.3f}¡À{m['std']:6.3f} ms "
-                  f" p50={p50['mean']:8.3f}¡À{p50['std']:6.3f}  p95={p95['mean']:8.3f}¡À{p95['std']:6.3f} "
-                  f" throughput={tp['mean']:8.1f}¡À{tp['std']:6.1f} /s  (n={m['n']})")
+            print(f"  batch={bs:4d}  mean={m['mean']:8.3f}+/-{m['std']:6.3f} ms "
+                  f" p50={p50['mean']:8.3f}+/-{p50['std']:6.3f}  p95={p95['mean']:8.3f}+/-{p95['std']:6.3f} "
+                  f" throughput={tp['mean']:8.1f}+/-{tp['std']:6.1f} /s  (n={m['n']})")
         else:  # split
             tot = stats["total"]; h2d = stats["h2d"]; fwd = stats["fwd"]; tp = stats["throughput"]
-            print(f"  batch={bs:4d}  TOTAL  mean={tot['mean_ms']['mean']:8.3f}¡À{tot['mean_ms']['std']:6.3f} ms"
-                  f"  p50={tot['p50_ms']['mean']:8.3f}¡À{tot['p50_ms']['std']:6.3f}"
-                  f"  p95={tot['p95_ms']['mean']:8.3f}¡À{tot['p95_ms']['std']:6.3f}  throughput={tp['mean']:8.1f}¡À{tp['std']:6.1f}/s")
-            print(f"             H2D    mean={h2d['mean_ms']['mean']:8.3f}¡À{h2d['mean_ms']['std']:6.3f}  "
-                  f"p50={h2d['p50_ms']['mean']:8.3f}¡À{h2d['p50_ms']['std']:6.3f}  "
-                  f"p95={h2d['p95_ms']['mean']:8.3f}¡À{h2d['p95_ms']['std']:6.3f}")
-            print(f"             FWD    mean={fwd['mean_ms']['mean']:8.3f}¡À{fwd['mean_ms']['std']:6.3f}  "
-                  f"p50={fwd['p50_ms']['mean']:8.3f}¡À{fwd['p50_ms']['std']:6.3f}  "
-                  f"p95={fwd['p95_ms']['mean']:8.3f}¡À{fwd['p95_ms']['std']:6.3f}")
+            print(f"  batch={bs:4d}  TOTAL  mean={tot['mean_ms']['mean']:8.3f}+/-{tot['mean_ms']['std']:6.3f} ms"
+                  f"  p50={tot['p50_ms']['mean']:8.3f}+/-{tot['p50_ms']['std']:6.3f}"
+                  f"  p95={tot['p95_ms']['mean']:8.3f}+/-{tot['p95_ms']['std']:6.3f}  throughput={tp['mean']:8.1f}+/-{tp['std']:6.1f}/s")
+            print(f"             H2D    mean={h2d['mean_ms']['mean']:8.3f}+/-{h2d['mean_ms']['std']:6.3f}  "
+                  f"p50={h2d['p50_ms']['mean']:8.3f}+/-{h2d['p50_ms']['std']:6.3f}  "
+                  f"p95={h2d['p95_ms']['mean']:8.3f}+/-{h2d['p95_ms']['std']:6.3f}")
+            print(f"             FWD    mean={fwd['mean_ms']['mean']:8.3f}+/-{fwd['mean_ms']['std']:6.3f}  "
+                  f"p50={fwd['p50_ms']['mean']:8.3f}+/-{fwd['p50_ms']['std']:6.3f}  "
+                  f"p95={fwd['p95_ms']['mean']:8.3f}+/-{fwd['p95_ms']['std']:6.3f}")
 def pretty_print(title, device, params, results):
     print("="*80)
     print(f"{title} | device={device.type} | params={params/1e6:.3f} M")
@@ -278,6 +374,7 @@ def main():
             z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0))
         for z in [64,32,16,8,4,2,1,0]
     ]
+    '''
     # ====== evaluation ======
     results_table = []  
     for name, ctor in MODEL_SPECS:
@@ -291,7 +388,7 @@ def main():
             print(f"[SKIP] {name}: no ckpt found (expect data/model/{name}_sX_best.pth)")
             continue
 
-        # ¡ª¡ª accuracy¡ª¡ª
+        # -- accuracy --
         maes, rmses, p95s, hi_maes = [], [], [], []
         params_ref = None
         for s, p in ckpts:
@@ -311,7 +408,7 @@ def main():
 
         # mean and std
         import statistics
-        def mstd(x):  # ·µ»Ø (mean, std)
+        def mstd(x):  # return (mean, std)
             return (float(statistics.mean(x)), float(statistics.pstdev(x)) if len(x)>1 else 0.0)
 
         mae_m, mae_s   = mstd(maes)
@@ -320,13 +417,13 @@ def main():
         htm_m, htm_s   = mstd(hi_maes)
 
         print(f"[AGG][{name}] seeds={len(ckpts)}  "
-              f"MAE={mae_m:.8f}¡À{mae_s:.8f}  RMSE={rmse_m:.8f}¡À{rmse_s:.8f}  "
-              f"P95={p95_m:.8f}¡À{p95_s:.8f}  High¦¨={htm_m:.8f}¡À{htm_s:.8f}  "
+              f"MAE={mae_m:.8f}+/-{mae_s:.8f}  RMSE={rmse_m:.8f}+/-{rmse_s:.8f}  "
+              f"P95={p95_m:.8f}+/-{p95_s:.8f}  HighTheta={htm_m:.8f}+/-{htm_s:.8f}  "
               f"Params={params_ref/1e6:.3f}M")
 
         results_table.append((name, len(ckpts), mae_m, mae_s, rmse_m, rmse_s, p95_m, p95_s, htm_m, htm_s, params_ref))
 
-        # ¡ª¡ª speed ¡ª¡ª
+        # -- speed --
         # CPU
         cpu_runs = []
         params_ref = None
@@ -363,7 +460,7 @@ def main():
                 mg = ctor().to(device_gpu).eval()
                 mg.load_state_dict(torch.load(p, map_location=device_gpu))
                 r = run_benchmark(mg, device_gpu,
-                                  batch_sizes=(1, 1024), repeats=300, warmup=80,
+                                  batch_sizes=(1, 2048), repeats=300, warmup=80,
                                   measure="device_only", use_amp=False,
                                   sample_source=sample_source)
                 gpu_runs.append(r)
@@ -376,7 +473,7 @@ def main():
                 mg = ctor().to(device_gpu).eval()
                 mg.load_state_dict(torch.load(p, map_location=device_gpu))
                 r = run_benchmark(mg, device_gpu,
-                                  batch_sizes=(1, 1024), repeats=300, warmup=80,
+                                  batch_sizes=(1, 2048), repeats=300, warmup=80,
                                   measure="device_only", use_amp=True,
                                   sample_source=sample_source)
                 gpu_amp_runs.append(r)
@@ -401,6 +498,123 @@ def main():
     print("Name, Nseeds, MAE_mean, MAE_std, RMSE_mean, RMSE_std, P95_mean, P95_std, HighThetaMAE_mean, HighThetaMAE_std, Params")
     for row in results_table:
         print(", ".join([row[0], str(row[1])] + [f"{v:.6g}" if isinstance(v, float) else str(v) for v in row[2:]]))
+        '''
+# ======HEAD-ONLY evaluation======
+    print("\n" + "="*80)
+    print(">>> HEAD-ONLY evaluation (encoder offline, online only runs head) <<<")
+
+    ENC_Z_LIST = [64, 32, 16, 8, 4, 2, 1, 0]
+    SEEDS = [0,1,2,3,4]
+    BATCH_GRID = [1, 2048] 
+
+    for z in ENC_Z_LIST:
+        name = f"Encoder_{z}"
+
+        ckpts = []
+        for s in SEEDS:
+            p = os.path.join("data", "model", f"{name}_s{s}_best.pth")
+            if os.path.exists(p):
+                ckpts.append((s, p))
+        if not ckpts:
+            print(f"[HEAD-ONLY][SKIP] {name}: no ckpt")
+            continue
+
+        # -----z-cache----------
+        caches = []
+        for s, p in ckpts:
+            cache_path = os.path.join("data", "model", f"zcache_{name}_s{s}.npz")
+            if not os.path.exists(cache_path):
+                precompute_z_cache(p, z, x_te, y_te, cache_path, angle_dim=4, batch=4096)
+            caches.append((s, p, cache_path))
+
+        # -----accuracy: z-cache + head-only-----
+        maes, rmses, p95s, hi_maes = [], [], [], []
+        params_ref = None
+        for s, p, cache in caches:
+            head_only = build_head_only_from_ckpt(p, z_dim=z).to(device_cpu).eval()
+            if params_ref is None: params_ref = count_params(head_only)
+            M = eval_headonly_metrics(head_only, cache)
+            maes.append(M["MAE"]); rmses.append(M["RMSE"]); p95s.append(M["P95"]); hi_maes.append(M["HighThetaMAE"])
+            print(f"[HEAD-ONLY][{name}][seed={s}] MAE={M['MAE']:.8f}  RMSE={M['RMSE']:.8f}  P95={M['P95']:.8f}  HighThetaMAE={M['HighThetaMAE']:.8f}")
+
+        def mstd(x): 
+            import statistics
+            return (float(statistics.mean(x)), float(statistics.pstdev(x)) if len(x)>1 else 0.0)
+        mae_m, mae_s   = mstd(maes)
+        rmse_m, rmse_s = mstd(rmses)
+        p95_m, p95_s   = mstd(p95s)
+        htm_m, htm_s   = mstd(hi_maes)
+        print(f"[HEAD-ONLY][AGG][{name}] seeds={len(caches)}  "
+              f"MAE={mae_m:.8f}+/-{mae_s:.8f}  RMSE={rmse_m:.8f}+/-{rmse_s:.8f}  "
+              f"P95={p95_m:.8f}+/-{p95_s:.8f}  HighTheta={htm_m:.8f}+/-{htm_s:.8f}  "
+              f"Params(head)={params_ref/1e6:.3f}M")
+
+        # ---- speed: benchmark head ----
+        # CPU device-only
+        cpu_runs = []
+        for s, p, cache in caches:
+            sample_src = make_head_sample_source(cache)
+            m_cpu = build_head_only_from_ckpt(p, z_dim=z).to(device_cpu).eval()
+            r = run_benchmark(m_cpu, device_cpu,
+                              batch_sizes=tuple(BATCH_GRID), repeats=300, warmup=80,
+                              measure="device_only", use_amp=False,
+                              sample_source=sample_src)
+            cpu_runs.append(r)
+        cpu_agg = aggregate_bench_results(cpu_runs)
+        pretty_print_agg(f"[HEAD-ONLY]{name} | CPU device-only fp32 (seeds={len(caches)})", device_cpu, params_ref, cpu_agg)
+
+        # CPU split£¨BS=1£©
+        cpu_split_runs = []
+        for s, p, cache in caches:
+            sample_src = make_head_sample_source(cache)
+            m_cpu = build_head_only_from_ckpt(p, z_dim=z).to(device_cpu).eval()
+            r = run_benchmark(m_cpu, device_cpu,
+                              batch_sizes=(1,), repeats=400, warmup=100,
+                              measure="split", use_amp=False,
+                              sample_source=sample_src)
+            cpu_split_runs.append(r)
+        cpu_split_agg = aggregate_bench_results(cpu_split_runs)
+        pretty_print_agg(f"[HEAD-ONLY]{name} | CPU split fp32 (BS=1, seeds={len(caches)})", device_cpu, params_ref, cpu_split_agg)
+
+        # GPU
+        if device_gpu is not None:
+            gpu_runs = []
+            for s, p, cache in caches:
+                sample_src = make_head_sample_source(cache)
+                m_gpu = build_head_only_from_ckpt(p, z_dim=z).to(device_gpu).eval()
+                r = run_benchmark(m_gpu, device_gpu,
+                                  batch_sizes=tuple(BATCH_GRID), repeats=300, warmup=80,
+                                  measure="device_only", use_amp=False,
+                                  sample_source=sample_src)
+                gpu_runs.append(r)
+            gpu_agg = aggregate_bench_results(gpu_runs)
+            pretty_print_agg(f"[HEAD-ONLY]{name} | GPU device-only fp32 (seeds={len(caches)})", device_gpu, params_ref, gpu_agg)
+
+            # AMP
+            gpu_amp_runs = []
+            for s, p, cache in caches:
+                sample_src = make_head_sample_source(cache)
+                m_gpu = build_head_only_from_ckpt(p, z_dim=z).to(device_gpu).eval()
+                r = run_benchmark(m_gpu, device_gpu,
+                                  batch_sizes=tuple(BATCH_GRID), repeats=300, warmup=80,
+                                  measure="device_only", use_amp=True,
+                                  sample_source=sample_src)
+                gpu_amp_runs.append(r)
+            gpu_amp_agg = aggregate_bench_results(gpu_amp_runs)
+            pretty_print_agg(f"[HEAD-ONLY]{name} | GPU device-only AMP(fp16) (seeds={len(caches)})", device_gpu, params_ref, gpu_amp_agg)
+
+            # GPU split£¨BS=1£©
+            gpu_split_runs = []
+            for s, p, cache in caches:
+                sample_src = make_head_sample_source(cache)
+                m_gpu = build_head_only_from_ckpt(p, z_dim=z).to(device_gpu).eval()
+                r = run_benchmark(m_gpu, device_gpu,
+                                  batch_sizes=(1,), repeats=400, warmup=100,
+                                  measure="split", use_amp=False,
+                                  sample_source=sample_src)
+                gpu_split_runs.append(r)
+            gpu_split_agg = aggregate_bench_results(gpu_split_runs)
+            pretty_print_agg(f"[HEAD-ONLY]{name} | GPU split fp32 (BS=1, seeds={len(caches)})", device_gpu, params_ref, gpu_split_agg)
 
 
 
