@@ -512,7 +512,7 @@ def train_once(model, loaders, *, tag, seed=0, train_mode="full",
 def run_all_experiments():
     input_dim = 260
     seeds = [0, 1, 2, 3, 4]
-
+    
     # 1) model list
     exp_list = [
         ("FCNN",        lambda: G1FCNN(input_dim),                         "full", None),
@@ -522,7 +522,7 @@ def run_all_experiments():
         ("CNN_GAP_DW",      lambda: G1CNN_GAP_DW(input_dim, width_mult=1.0), "full", None),
         ("CNN_GAP_DW_Wide", lambda: G1CNN_GAP_DW(input_dim, width_mult=2.0), "full", None),
     ]
-    for z in [64, 32, 16, 8, 4, 2, 1, 0]:
+    for z in [128,64, 32, 16, 8, 4, 2, 1, 0]:
         exp_list.append((
             f"Encoder_{z}",
             lambda z=z: build_model(z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0),
