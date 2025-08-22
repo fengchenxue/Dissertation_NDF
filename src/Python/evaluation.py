@@ -35,6 +35,53 @@ def _stats(arr):
 
 # ------------------------- Generic benchmarking -------------------------
 
+def eval_metrics_on_loader(model: nn.Module,
+                           loader: torch.utils.data.DataLoader,
+                           device: torch.device,
+                           high_theta_threshold: float = 1.2):
+    """Compute MAE / RMSE / P95 / HighThetaMAE for a full model over a DataLoader."""
+    model.eval()
+    mae_sum = 0.0
+    mse_sum = 0.0
+    n_total = 0
+    abs_err_chunks = []
+
+    hi_mae_sum = 0.0
+    hi_count = 0
+
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=True).float()
+            yb = yb.to(device, non_blocking=True).float().view(-1, 1)
+
+            pred = model(xb)
+            err  = (pred - yb).view(-1)
+
+            # accumulate MAE / RMSE
+            ae = err.abs()
+            mae_sum += ae.sum().item()
+            mse_sum += (err * err).sum().item()
+            n_total += ae.numel()
+            abs_err_chunks.append(ae.detach().cpu())
+
+            # High-theta mask: theta from cos/sin in the first two features
+            cos_t = xb[:, 0].clamp(-1, 1).detach().cpu()
+            sin_t = xb[:, 1].clamp(-1, 1).detach().cpu()
+            theta = torch.atan2(sin_t, cos_t)
+            mask  = theta >= high_theta_threshold
+            if mask.any():
+                hi_mae_sum += ae.detach().cpu()[mask].sum().item()
+                hi_count   += int(mask.sum().item())
+
+    mae  = mae_sum / max(1, n_total)
+    rmse = float(math.sqrt(mse_sum / max(1, n_total)))
+
+    abs_all = torch.cat(abs_err_chunks) if abs_err_chunks else torch.tensor([])
+    p95  = torch.quantile(abs_all, 0.95).item() if abs_all.numel() else float("nan")
+    hi_mae = (hi_mae_sum / hi_count) if hi_count > 0 else float("nan")
+
+    return {"MAE": mae, "RMSE": rmse, "P95": p95, "HighThetaMAE": hi_mae, "N": n_total}
+
 def benchmark_once(model, inputs, device, measure="device_only", use_amp=False):
     """One timing sample. No gradients. Optional AMP on CUDA."""
     model.eval()
