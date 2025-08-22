@@ -1,17 +1,10 @@
-import os, time, statistics, math
 import numpy as np
 import torch
 import torch.nn as nn
-
 import model_G
-
-
-
 import os, time, statistics
-import numpy as np
-import torch
-import torch.nn as nn
-import model_G
+import math
+from sklearn.model_selection import train_test_split
 
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
@@ -124,6 +117,53 @@ def run_benchmark(model, device, batch_sizes=(1, 256), repeats=200, warmup=50,
             }
     return results
 
+@torch.inference_mode()
+def eval_metrics_on_loader(model, loader, device, high_theta_threshold=1.2):
+    model.eval()
+    mae_sum = 0.0; mse_sum = 0.0; n = 0
+    abs_errs = []
+    hi_mae_sum = 0.0; hi_cnt = 0
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True); yb = yb.to(device, non_blocking=True)
+        pred = model(xb)
+        err = (pred - yb).view(-1)
+        ae  = err.abs()
+        mae_sum += ae.sum().item()
+        mse_sum += (err * err).sum().item()
+        n += ae.numel()
+        abs_errs.append(ae.cpu())
+        # high ¦È£º¦È = atan2(sin¦È, cos¦È)
+        cos_t = xb[:, 0].clamp(-1, 1); sin_t = xb[:, 1].clamp(-1, 1)
+        theta = torch.atan2(sin_t, cos_t)
+        mask = theta >= high_theta_threshold
+        if mask.any():
+            hi_mae_sum += ae[mask].sum().item()
+            hi_cnt += int(mask.sum().item())
+    mae  = mae_sum / max(1, n)
+    rmse = math.sqrt(mse_sum / max(1, n))
+    abs_all = torch.cat(abs_errs) if len(abs_errs) else torch.tensor([])
+    p95  = torch.quantile(abs_all, 0.95).item() if abs_all.numel() else float("nan")
+    hi_mae = (hi_mae_sum / hi_cnt) if hi_cnt > 0 else float("nan")
+    return {"MAE": mae, "RMSE": rmse, "P95": p95, "HighThetaMAE": hi_mae, "N": n}
+
+def make_loaders_from_npz(npz_path, batch=2048, seed=42):
+    npz = np.load(npz_path)
+    x, y = npz["x"], npz["y"]
+    x_tr, x_tmp, y_tr, y_tmp = train_test_split(x, y, test_size=0.2, random_state=seed)
+    x_va, x_te, y_va, y_te = train_test_split(x_tmp, y_tmp, test_size=0.5, random_state=seed)
+    te_loader = torch.utils.data.DataLoader(model_G.G1Dataset(x_te, y_te), batch_size=batch, shuffle=False, pin_memory=True)
+    return te_loader, (x_te, y_te)
+
+def build_sample_source_from_test(x_te):
+    N = x_te.shape[0]
+    rng = torch.Generator(device="cpu").manual_seed(0)
+    X_cpu = torch.from_numpy(x_te).float()
+    if torch.cuda.is_available(): X_cpu = X_cpu.pin_memory()
+    def sample(bs: int) -> torch.Tensor:
+        idx = torch.randint(low=0, high=N, size=(bs,), generator=rng)
+        return X_cpu[idx]
+    return sample
+
 def pretty_print(title, device, params, results):
     print("="*80)
     print(f"{title} | device={device.type} | params={params/1e6:.3f} M")
@@ -143,73 +183,60 @@ def pretty_print_split(title, device, params, results):
         print(f"             FWD    mean={fwd['mean_ms']:8.3f} ms  p50={fwd['p50_ms']:8.3f} ms  p95={fwd['p95_ms']:8.3f} ms")
 
 def main():
-    # import os
-    # torch.set_num_threads(1); os.environ["OMP_NUM_THREADS"]="1"; os.environ["MKL_NUM_THREADS"]="1"
 
     torch.backends.cudnn.benchmark = True
     device_cpu = torch.device("cpu")
     device_gpu = torch.device("cuda") if torch.cuda.is_available() else None
 
-    input_dim = 260
-    fcnn_ckpt = "data/model/model_G1_FCNN_100K.pth"
-    cnn_ckpt  = "data/model/model_G1_CNN_GAP_DW.pth"
+    npz_path = "data/dataset/dataset_G_100k.npz"   
+    te_loader, (x_te, y_te) = make_loaders_from_npz(npz_path, batch=2048, seed=42)
+    sample_source = build_sample_source_from_test(x_te)
 
-    npz = np.load("data/dataset/dataset_G_100k.npz")
-    X = torch.from_numpy(npz["x"]).float()
-    if torch.cuda.is_available():
-        X = X.pin_memory()
 
-    rng = torch.Generator(device="cpu").manual_seed(0)
-    N = X.shape[0]
-    def sample_source(bs: int) -> torch.Tensor:
-        idx = torch.randint(low=0, high=N, size=(bs,), generator=rng)
-        return X[idx]
+    MODELS = [
+        ("FCNN",        lambda: model_G.G1FCNN(260),               "data/model/model_G1_FCNN_100K.pth"),
+        ("Encoder_4",   lambda: model_G.build_model(z_dim=4, head_hidden=(128,64), act="relu", dropout=0.0),"data/model/model_G1_z4_100K.pth"),
+    ]
 
-    fcnn = model_G.G1FCNN(input_dim)
-    cnn  = model_G.G1CNN_GAP_DW(input_dim)
-
-    if os.path.exists(fcnn_ckpt):
-        fcnn.load_state_dict(torch.load(fcnn_ckpt, map_location="cpu"))
-    if os.path.exists(cnn_ckpt):
-        cnn.load_state_dict(torch.load(cnn_ckpt, map_location="cpu"))
-
-    # ---------------- CPU ----------------
-    for name, model in [("FCNN", fcnn), ("CNN", cnn)]:
-        m = model.to(device_cpu).eval()
+    for name, ctor, ckpt in MODELS:
+        # ---------------- accuracy (TEST)----------------
+        m = ctor().to(device_cpu).eval()
+        if os.path.exists(ckpt):
+            m.load_state_dict(torch.load(ckpt, map_location="cpu"))
         params = count_params(m)
-        r1 = run_benchmark(m, device_cpu, batch_sizes=(1, 256), repeats=200, warmup=50,
-                           measure="device_only", use_amp=False, sample_source=sample_source)
-        pretty_print(f"{name} | device-only | fp32", device_cpu, params, r1)
+        metrics = eval_metrics_on_loader(m.to(device_cpu), te_loader, device_cpu)
+        print(f"[TEST][{name}] MAE={metrics['MAE']:.8f}  RMSE={metrics['RMSE']:.8f}  "
+              f"P95={metrics['P95']:.8f}  HighThetaMAE={metrics['HighThetaMAE']:.8f}  "
+              f"Params={params/1e6:.4f}M")
 
-        r2 = run_benchmark(m, device_cpu, batch_sizes=(1, 256), repeats=200, warmup=50,
-                           measure="end_to_end", use_amp=False, sample_source=sample_source)
-        pretty_print(f"{name} | end-to-end | fp32", device_cpu, params, r2)
+        # ---------------- speed (CPU) ----------------
+        r_cpu = run_benchmark(m.to(device_cpu), device_cpu,
+                              batch_sizes=(1, 2048), repeats=200, warmup=50,
+                              measure="device_only", use_amp=False, sample_source=sample_source)
+        pretty_print(f"{name} | CPU device-only fp32", device_cpu, params, r_cpu)
 
-        rsplit = run_benchmark(m, device_cpu, batch_sizes=(1,), repeats=200, warmup=50,
-                               measure="split", use_amp=False, sample_source=sample_source)
-        pretty_print_split(f"{name} | split (CPU)", device_cpu, params, rsplit)
+        # ---------------- speed (GPU) ----------------
+        if device_gpu is not None:
+            mg = ctor().to(device_gpu).eval()
+            if os.path.exists(ckpt):
+                mg.load_state_dict(torch.load(ckpt, map_location=device_gpu))
+            params_g = count_params(mg)
+            r_gpu = run_benchmark(mg, device_gpu,
+                                  batch_sizes=(1, 1024), repeats=300, warmup=80,
+                                  measure="device_only", use_amp=False, sample_source=sample_source)
+            pretty_print(f"{name} | GPU device-only fp32", device_gpu, params_g, r_gpu)
 
-    # ---------------- GPU ----------------
-    if device_gpu is not None:
-        for name, model in [("FCNN", fcnn), ("CNN", cnn)]:
-            m = model.to(device_gpu).eval()
-            params = count_params(m)
+            r_gpu_amp = run_benchmark(mg, device_gpu,
+                                      batch_sizes=(1, 1024), repeats=300, warmup=80,
+                                      measure="device_only", use_amp=True, sample_source=sample_source)
+            pretty_print(f"{name} | GPU device-only AMP(fp16)", device_gpu, params_g, r_gpu_amp)
 
-            r1 = run_benchmark(m, device_gpu, batch_sizes=(1, 1024), repeats=300, warmup=80,
-                               measure="device_only", use_amp=False, sample_source=sample_source)
-            pretty_print(f"{name} | device-only | fp32", device_gpu, params, r1)
+            r_split = run_benchmark(mg, device_gpu,
+                                    batch_sizes=(1,), repeats=400, warmup=100,
+                                    measure="split", use_amp=False, sample_source=sample_source)
+            pretty_print_split(f"{name} | GPU split(fp32, bs=1)", device_gpu, params_g, r_split)
 
-            r2 = run_benchmark(m, device_gpu, batch_sizes=(1, 1024), repeats=300, warmup=80,
-                               measure="end_to_end", use_amp=False, sample_source=sample_source)
-            pretty_print(f"{name} | end-to-end | fp32", device_gpu, params, r2)
 
-            r3 = run_benchmark(m, device_gpu, batch_sizes=(1, 1024), repeats=300, warmup=80,
-                               measure="device_only", use_amp=True, sample_source=sample_source)
-            pretty_print(f"{name} | device-only | AMP(fp16)", device_gpu, params, r3)
-
-            rsplit = run_benchmark(m, device_gpu, batch_sizes=(1,), repeats=400, warmup=100,
-                                   measure="split", use_amp=False, sample_source=sample_source)
-            pretty_print_split(f"{name} | split (GPU fp32, batch=1)", device_gpu, params, rsplit)
 
 if __name__ == "__main__":
     main()

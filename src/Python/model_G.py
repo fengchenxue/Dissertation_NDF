@@ -308,7 +308,7 @@ def G1_train():
         head_hidden=(128, 64),    # (64) / (256,128)
         angle_dim=4,
         act="relu",               # "relu" or "silu"
-        dropout=0.05               
+        dropout=0.0               
         ).to(device)
     
     train_mode = "head"
