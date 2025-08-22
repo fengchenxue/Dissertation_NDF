@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
-
+import ndf_py as _ndf
 import model_G
 
 # Make single-thread CPU runs stable/reproducible
@@ -32,6 +32,84 @@ def _stats(arr):
         "n":       len(arr),
     }
 
+# ---------- Traditional G1 (C++ via pybind) ----------
+
+def g1_traditional_eval(X_np):
+    """
+    X_np: (B, 260) float32 = [cosT, sinT, cosP, sinP, Dx(128), Dy(128)]
+    Returns: (B,) float32
+    """
+    
+    if hasattr(_ndf, "G1_batch"):
+        y = _ndf.G1_batch(X_np.astype(np.float32))
+        return np.asarray(y, dtype=np.float32).reshape(-1)
+    else:
+        # Fallback: per-sample loop (good for BS=1 latency; slower for large BS)
+        B, C = X_np.shape
+        nc = (C - 4) // 2
+        y = np.empty((B,), dtype=np.float32)
+        wh = _ndf.Vec3f(0.0, 0.0, 1.0)
+        for i in range(B):
+            cos_t, sin_t, cos_p, sin_p = X_np[i, :4]
+            Dx = X_np[i, 4:4 + nc].tolist()
+            Dy = X_np[i, 4 + nc:4 + 2 * nc].tolist()
+            w = _ndf.Vec3f(float(sin_t * cos_p), float(sin_t * sin_p), float(cos_t))
+            ndf = _ndf.PiecewiseLinearNDF(Dx, Dy)
+            y[i] = float(ndf.G1(w, wh))
+        return y
+
+def benchmark_traditional_g1(sample_source, batch_sizes=(1, 2048), repeats=200, warmup=50):
+    """
+    CPU-only benchmark for traditional C++ G1 via pybind.
+    Uses the same batch grid and statistics as NN benchmarks.
+    Returns: {bs: {"mean_ms","p50_ms","p95_ms","throughput"}}
+    """
+    import numpy as _np, time
+    results = {}
+    # warmup
+    for bs in batch_sizes:
+        for _ in range(warmup):
+            X = sample_source(bs).numpy()  # (bs,260) on CPU
+            _ = g1_traditional_eval(X)
+    # measure
+    for bs in batch_sizes:
+        times = []
+        for _ in range(repeats):
+            X = sample_source(bs).numpy()
+            t0 = time.perf_counter()
+            _ = g1_traditional_eval(X)
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000.0)
+        t = _np.array(times, dtype=_np.float64)
+        results[bs] = {
+            "mean_ms": float(_np.mean(t)),
+            "p50_ms":  float(_np.median(t)),
+            "p95_ms":  float(_np.percentile(t, 95)),
+            "throughput": float(bs / (_np.mean(t) / 1000.0)),
+        }
+    return results
+
+def pretty_print_trad(title, results):
+    print("=" * 80)
+    print(f"{title}")
+    for bs in sorted(results.keys()):
+        r = results[bs]
+        print(f"  batch={bs:4d}  mean={r['mean_ms']:8.3f} ms  "
+              f"p50={r['p50_ms']:8.3f}  p95={r['p95_ms']:8.3f}  "
+              f"throughput={r['throughput']:8.1f}/s")
+
+def sanity_check_traditional_accuracy(x_te: np.ndarray, y_te: np.ndarray, n=20000):
+    """Quick check: traditional G1 vs dataset y on a random subset."""
+    import numpy as _np, torch
+    N = min(n, x_te.shape[0])
+    idx = torch.randperm(x_te.shape[0])[:N].numpy()
+    X = x_te[idx].astype(_np.float32)
+    Y = y_te[idx].astype(_np.float32).reshape(-1)
+    pred = g1_traditional_eval(X)
+    ae = _np.abs(pred - Y)
+    mae = float(ae.mean())
+    p95 = float(_np.percentile(ae, 95))
+    print(f"[SANITY][Traditional G1 vs dataset y] N={N}  MAE={mae:.6g}  P95={p95:.6g}")
 
 # ------------------------- Generic benchmarking -------------------------
 
@@ -393,7 +471,7 @@ def main():
             z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0))
         for z in [128,64,32,16,8,4,2,1,0]
     ]
-
+    
     # ====== full model evaluation ======
     results_table = []  
     for name, ctor in MODEL_SPECS:
@@ -638,7 +716,46 @@ def main():
             gpu_split_agg = aggregate_bench_results(gpu_split_runs)
             pretty_print_agg(f"[HEAD-ONLY]{name} | GPU split fp32 (BS=1, seeds={len(caches)})", device_gpu, params_ref, gpu_split_agg)
 
+ # ----- Traditional G1 CPU benchmark (fair CPU-vs-CPU) -----
+    print("\n" + "="*80)
+    print(">>> Traditional G1 (C++ via pybind) vs head-only (CPU) <<<")
 
+    # Reuse the same batch grid you used for NN head-only
+    BATCH_GRID = [1,2048]
+
+    # Build a sample_source that returns (bs,260) from the test split
+    sample_source_full = build_sample_source_from_test(x_te)
+
+    # Optional: sanity-check accuracy
+    sanity_check_traditional_accuracy(x_te, y_te, n=20000)
+
+    # Benchmark traditional C++ G1 on CPU
+    trad_res = benchmark_traditional_g1(sample_source_full,
+                                        batch_sizes=tuple(BATCH_GRID),
+                                        repeats=200, warmup=50)
+    pretty_print_trad("Traditional G1 | CPU (aligned batches)", trad_res)
+
+    # (Optional) Print a quick side-by-side with your chosen head-only model (e.g., Encoder_64)
+    chosen_z = 64
+    chosen_ckpts = [p for s in [0,1,2,3,4]
+                    for p in [os.path.join("data", "model", f"Encoder_{chosen_z}_s{s}_best.pth")]
+                    if os.path.exists(p)]
+    if len(chosen_ckpts) > 0:
+        # Aggregate CPU head-only device-only results for the chosen z
+        cpu_runs = []
+        for p in chosen_ckpts:
+            m_cpu = build_head_only_from_ckpt(p, z_dim=chosen_z).to(torch.device("cpu")).eval()
+            r = run_benchmark(m_cpu, torch.device("cpu"),
+                              batch_sizes=tuple(BATCH_GRID),
+                              repeats=200, warmup=50,
+                              measure="device_only", use_amp=False,
+                              sample_source=make_head_sample_source(
+                                  os.path.join("data", "model", f"zcache_Encoder_{chosen_z}_s{p.split('_s')[-1].split('_')[0]}.npz")
+                              ))
+            cpu_runs.append(r)
+        cpu_agg = aggregate_bench_results(cpu_runs)
+        pretty_print_agg(f"[HEAD-ONLY] Encoder_{chosen_z} | CPU device-only fp32 (seeds={len(chosen_ckpts)})",
+                         torch.device("cpu"), count_params(build_head_only_from_ckpt(chosen_ckpts[0], chosen_z)), cpu_agg)
 
 if __name__ == "__main__":
     main()
