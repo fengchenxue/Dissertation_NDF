@@ -46,6 +46,7 @@ Desktop.ini
 /PythonTraining.pyproj
 __pycache__/
 data/model/
+vis_all/
 
 # macOS
 .DS_Store

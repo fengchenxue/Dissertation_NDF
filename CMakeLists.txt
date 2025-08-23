@@ -3,7 +3,7 @@ project(Dissertation_NDF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 #----python-------
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 set(PYTHON_EXECUTABLE_PATH "${Python3_EXECUTABLE}")

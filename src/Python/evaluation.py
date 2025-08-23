@@ -6,6 +6,7 @@ from sklearn.model_selection import train_test_split
 import ndf_py as _ndf
 import model_G
 import re
+import matplotlib.pyplot as plt
 # Make single-thread CPU runs stable/reproducible
 torch.set_num_threads(1)
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -485,6 +486,117 @@ def eval_headonly_metrics(head_model: nn.Module, z_cache_path: str, high_theta_t
     hi_mae = (hi_mae_sum / hi_cnt) if hi_cnt > 0 else float("nan")
     return {"MAE": mae, "RMSE": rmse, "P95": p95, "HighThetaMAE": hi_mae, "N": n}
 
+@torch.inference_mode()
+def render_g1_maps(ndf_dx, ndf_dy, nn_model, device, W=256, H=128, save_prefix="vis",
+                   vmin=0.0, vmax=1.0, cmap_val="inferno", cmap_err="magma"):
+    """
+    Render G1(theta,phi) heatmaps for a given NDF using a FULL model that takes 260-D input,
+    and compare against the traditional C++ implementation. Saves a side-by-side PNG.
+
+    nn_model: expects input (B,260) = [cosT,sinT,cosP,sinP,Dx(128),Dy(128)]
+    """
+    theta = np.linspace(0, np.pi/2, H, endpoint=True, dtype=np.float32)   # 0..90 deg
+    phi   = np.linspace(0, 2*np.pi,  W, endpoint=False, dtype=np.float32) # 0..360 deg
+    TT, PP = np.meshgrid(theta, phi, indexing="ij")  # (H,W)
+
+    cos_t = np.cos(TT).reshape(-1,1); sin_t = np.sin(TT).reshape(-1,1)
+    cos_p = np.cos(PP).reshape(-1,1); sin_p = np.sin(PP).reshape(-1,1)
+    Dx = np.broadcast_to(ndf_dx.reshape(1,-1), (H*W, 128))
+    Dy = np.broadcast_to(ndf_dy.reshape(1,-1), (H*W, 128))
+    X  = np.concatenate([cos_t, sin_t, cos_p, sin_p, Dx, Dy], axis=1).astype(np.float32)
+
+    xb = torch.from_numpy(X).to(device)
+    nn_model.eval()
+    y_nn = nn_model(xb).detach().cpu().numpy().reshape(H, W)
+    y_tr = g1_traditional_eval(X).reshape(H, W)
+
+    err = np.abs(y_nn - y_tr)
+    mae = float(err.mean()); p95 = float(np.percentile(err, 95))
+
+    # draw
+    fig, axs = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
+    extent = [0, 360, 0, 90]  # phi deg, theta deg
+    im0 = axs[0].imshow(y_nn, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap_val, extent=extent, aspect="auto"); axs[0].set_title("NN G1")
+    im1 = axs[1].imshow(y_tr, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap_val, extent=extent, aspect="auto"); axs[1].set_title("Traditional G1")
+    im2 = axs[2].imshow(err,  origin="lower", cmap=cmap_err, extent=extent, aspect="auto"); axs[2].set_title(f"|err|  MAE={mae:.3f}, P95={p95:.3f}")
+    for ax in axs:
+        ax.set_xlabel("phi(deg)")
+    axs[0].set_ylabel("theta(deg)")
+
+    cbar0 = plt.colorbar(im0, ax=axs[:2], fraction=0.046, pad=0.02)
+    cbar0.set_label("G1 value")
+    cbar1 = plt.colorbar(im2, ax=axs[2],  fraction=0.046, pad=0.02)
+    cbar1.set_label("|err|")
+
+    out = f"{save_prefix}.png"
+    plt.savefig(out, dpi=200); plt.close()
+    print(f"[VIS] saved -> {out}")
+
+@torch.inference_mode()
+def render_g1_maps_headonly(ndf_dx, ndf_dy, enc_ckpt_path: str, head_ckpt_path: str,
+                            z_dim=64, head_hidden=(256,128), act="relu", dropout=0.0,
+                            device=None, W=256, H=128, save_prefix="vis_head",
+                            vmin=0.0, vmax=1.0, cmap_val="inferno", cmap_err="magma"):
+    """
+    Render G1(theta,phi) using HEAD-ONLY path (angle + z), compare with traditional.
+    - enc_ckpt_path: Encoder_64_sX_best.pth
+    - head_ckpt_path: HeadZ64_<...>_sX_best.pth (must match seed of encoder)
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1) build encoder to get z from (Dx,Dy)
+    full_for_enc = model_G.build_model(z_dim=z_dim, head_hidden=(128,64), act="relu", dropout=0.0).to(device).eval()
+    full_for_enc.load_state_dict(torch.load(enc_ckpt_path, map_location=device), strict=True)
+
+    seq = torch.from_numpy(np.stack([ndf_dx, ndf_dy], axis=0).astype(np.float32)).unsqueeze(0).to(device)  # (1,2,128)
+    z = full_for_enc.enc(seq).detach().cpu().numpy().reshape(1, -1)  # (1, z_dim)
+
+    # 2) build head-only model and load head weights
+    head_full = model_G.build_model(z_dim=z_dim, head_hidden=head_hidden, act=act, dropout=dropout)
+    head_full.load_state_dict(torch.load(head_ckpt_path, map_location="cpu"), strict=True)
+    head_only = _HeadOnly(head_full.head, angle_dim=4).to(device).eval()
+    disable_inplace(head_only)
+
+    # 3) build angle grid and concatenate z
+    theta = np.linspace(0, np.pi/2, H, endpoint=True, dtype=np.float32)
+    phi   = np.linspace(0, 2*np.pi,  W, endpoint=False, dtype=np.float32)
+    TT, PP = np.meshgrid(theta, phi, indexing="ij")
+    ANG = np.stack([np.cos(TT), np.sin(TT), np.cos(PP), np.sin(PP)], axis=-1).reshape(-1, 4).astype(np.float32)
+    Z   = np.repeat(z.astype(np.float32), repeats=ANG.shape[0], axis=0)  # (H*W, z_dim)
+    AZ  = np.concatenate([ANG, Z], axis=1)
+
+    # NN (head-only) prediction
+    y_nn = head_only(torch.from_numpy(AZ).to(device)).detach().cpu().numpy().reshape(H, W)
+
+    # Traditional reference (use Dx,Dy + angles)
+    Dx = np.broadcast_to(ndf_dx.reshape(1,-1), (H*W, 128))
+    Dy = np.broadcast_to(ndf_dy.reshape(1,-1), (H*W, 128))
+    X  = np.concatenate([ANG, Dx, Dy], axis=1).astype(np.float32)
+    y_tr = g1_traditional_eval(X).reshape(H, W)
+
+    # Error map
+    err = np.abs(y_nn - y_tr)
+    mae = float(err.mean()); p95 = float(np.percentile(err, 95))
+
+    # draw
+    fig, axs = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
+    extent = [0, 360, 0, 90]
+    im0 = axs[0].imshow(y_nn, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap_val, extent=extent, aspect="auto"); axs[0].set_title("NN G1 (head-only)")
+    im1 = axs[1].imshow(y_tr, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap_val, extent=extent, aspect="auto"); axs[1].set_title("Traditional G1")
+    im2 = axs[2].imshow(err,  origin="lower", cmap=cmap_err, extent=extent, aspect="auto"); axs[2].set_title(f"|err|  MAE={mae:.3f}, P95={p95:.3f}")
+    for ax in axs:
+        ax.set_xlabel("phi(deg)")
+    axs[0].set_ylabel("theta(deg)")
+    plt.colorbar(im0, ax=axs[:2], fraction=0.046, pad=0.02).set_label("G1 value")
+    plt.colorbar(im2, ax=axs[2],  fraction=0.046, pad=0.02).set_label("|err|")
+
+    out = f"{save_prefix}.png"
+    plt.savefig(out, dpi=200); plt.close()
+    print(f"[VIS] saved -> {out}")
+
+
+
 def main():
 
     torch.backends.cudnn.benchmark = True
@@ -877,5 +989,171 @@ def main():
         pretty_print_agg(f"[HEAD-SEARCH]{tag} | CPU device-only fp32", device_cpu,
                          count_params(head_only), cpu_agg)
 
+def render_case_full(model_name="Encoder_64", seed=0, sample_idx=0, out="vis_full"):
+    npz = np.load("data/dataset/dataset_G_100k.npz")
+    x, y = npz["x"], npz["y"]
+    x_tr, x_tmp, y_tr, y_tmp = train_test_split(x, y, test_size=0.2, random_state=42)
+    x_va, x_te, y_va, y_te = train_test_split(x_tmp, y_tmp, test_size=0.5, random_state=42)
+    Dx = x_te[sample_idx][4:4+128]; Dy = x_te[sample_idx][4+128:4+256]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if model_name.startswith("Encoder_"):
+        z = int(model_name.split("_")[1])
+        ctor = lambda: model_G.build_model(z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0)
+    else:
+        ctor_map = {
+            "FCNN": lambda: model_G.G1FCNN(260),
+            "CNN": lambda: model_G.G1CNN(260),
+            "CNN_GAP": lambda: model_G.G1CNN_GAP(260),
+            "CNN_GAP_S": lambda: model_G.G1CNN_GAP_S(260),
+        }
+        if hasattr(model_G, "G1CNN_GAP_DW"):
+            ctor_map["CNN_GAP_DW"] = lambda: model_G.G1CNN_GAP_DW(260, width_mult=1.0)
+        ctor = ctor_map[model_name]
+    m = ctor().to(device).eval()
+    ckpt = f"data/model/{model_name}_s{seed}_best.pth"
+    m.load_state_dict(torch.load(ckpt, map_location=device))
+    render_g1_maps(Dx, Dy, m, device, W=256, H=128, save_prefix=out)
+
+def render_case_head(tag="HeadZ64_256x128_relu_do0.00", seed=0, enc_seed=None, sample_idx=0, out="vis_head"):
+    """
+    tag must match your head ckpt name prefix (e.g., HeadZ64_256x128_relu_do0.00)
+    seed chooses which _s{seed}_best.pth to load.
+    enc_seed defaults to seed if not provided.
+    """
+    if enc_seed is None:
+        enc_seed = seed
+    npz = np.load("data/dataset/dataset_G_100k.npz")
+    x, y = npz["x"], npz["y"]
+    x_tr, x_tmp, y_tr, y_tmp = train_test_split(x, y, test_size=0.2, random_state=42)
+    x_va, x_te, y_va, y_te = train_test_split(x_tmp, y_tmp, test_size=0.5, random_state=42)
+    Dx = x_te[sample_idx][4:4+128]; Dy = x_te[sample_idx][4+128:4+256]
+
+    # parse z & head spec from tag
+    hidden, act, dropout = parse_head_tag(tag)
+    z_dim = 64  # tag is HeadZ64_...
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    enc_ckpt  = os.path.join("data","model", f"Encoder_{z_dim}_s{enc_seed}_best.pth")
+    head_ckpt = os.path.join("data","model", f"{tag}_s{seed}_best.pth")
+    render_g1_maps_headonly(Dx, Dy, enc_ckpt, head_ckpt, z_dim=z_dim,
+                            head_hidden=hidden, act=act, dropout=dropout,
+                            device=device, W=256, H=128, save_prefix=out)
+
+def _list_full_model_ckpts(model_dir="data/model"):
+    """
+    Find full-model checkpoints by naming convention: <ModelName>_s<seed>_best.pth
+    ModelName in {FCNN, CNN, CNN_GAP, CNN_GAP_S, CNN_GAP_DW?, Encoder_<z>}
+    Returns: list of (model_name, seed:int, ckpt_path)
+    """
+    out = []
+    for fn in os.listdir(model_dir):
+        m = re.match(r'^(FCNN|CNN|CNN_GAP|CNN_GAP_S|CNN_GAP_DW|Encoder_\d+)_s(\d+)_best\.pth$', fn)
+        if not m: 
+            continue
+        name, s = m.group(1), int(m.group(2))
+        out.append((name, s, os.path.join(model_dir, fn)))
+    return sorted(out)
+
+def _list_head_ckpts_with_encoder(model_dir="data/model"):
+    """
+    Find head-only checkpoints and match encoder ckpt with the same seed.
+    Head ckpt: HeadZ64_<...>_s<seed>_best.pth  (z=64 assumed)
+    Encoder ckpt to match: Encoder_64_s<seed>_best.pth
+    Returns: list of (tag, seed:int, head_ckpt, enc_ckpt, hidden, act, dropout)
+    """
+    heads = []
+    for fn in os.listdir(model_dir):
+        m = re.match(r'^(HeadZ64_[^_]+_(?:relu|silu)_do\d+\.\d+)_s(\d+)_best\.pth$', fn)
+        if not m: 
+            continue
+        tag, s = m.group(1), int(m.group(2))
+        head_ckpt = os.path.join(model_dir, fn)
+        enc_ckpt  = os.path.join(model_dir, f"Encoder_64_s{s}_best.pth")
+        if not os.path.exists(enc_ckpt):
+            print(f"[VIS][WARN] missing encoder for {fn} -> {enc_ckpt}, skip.")
+            continue
+        hidden, act, dropout = parse_head_tag(tag)
+        heads.append((tag, s, head_ckpt, enc_ckpt, hidden, act, dropout))
+    return sorted(heads)
+
+def _build_full_from_name(name: str):
+    """
+    Construct full model by name (for 260-D input).
+    """
+    if name.startswith("Encoder_"):
+        z = int(name.split("_")[1])
+        return model_G.build_model(z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0)
+    ctor_map = {
+        "FCNN":       lambda: model_G.G1FCNN(260),
+        "CNN":        lambda: model_G.G1CNN(260),
+        "CNN_GAP":    lambda: model_G.G1CNN_GAP(260),
+        "CNN_GAP_S":  lambda: model_G.G1CNN_GAP_S(260),
+    }
+    if hasattr(model_G, "G1CNN_GAP_DW"):
+        ctor_map["CNN_GAP_DW"] = lambda: model_G.G1CNN_GAP_DW(260, width_mult=1.0)
+    if name not in ctor_map:
+        raise ValueError(f"Unknown model name: {name}")
+    return ctor_map[name]()
+
+def _load_test_sample(npz_path="data/dataset/dataset_G_100k.npz", sample_idx=0):
+    """
+    Use the same split (seed=42) as elsewhere; return one test sample's Dx,Dy.
+    """
+    data = np.load(npz_path)
+    x, y = data["x"], data["y"]
+    x_tr, x_tmp, y_tr, y_tmp = train_test_split(x, y, test_size=0.2, random_state=42)
+    x_va, x_te, y_va, y_te = train_test_split(x_tmp, y_tmp, test_size=0.5, random_state=42)
+    if sample_idx < 0 or sample_idx >= x_te.shape[0]:
+        raise IndexError(f"sample_idx out of range: {sample_idx} / {x_te.shape[0]}")
+    Dx = x_te[sample_idx][4:4+128]; Dy = x_te[sample_idx][4+128:4+256]
+    return Dx.astype(np.float32), Dy.astype(np.float32)
+
+def visualize_all_models(sample_indices=(0,), outdir="vis_all", W=256, H=128,
+                         vmin=0.0, vmax=1.0, cmap_val="inferno", cmap_err="magma",
+                         npz_path="data/dataset/dataset_G_100k.npz", device=None):
+    """
+    Render G1(theta,phi) maps for ALL available models (full and head-only) on the same test samples.
+    Saves 3-panel PNGs to outdir.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Gather models
+    full_ckpts = _list_full_model_ckpts()
+    head_ckpts = _list_head_ckpts_with_encoder()
+
+    if not full_ckpts and not head_ckpts:
+        print("[VIS] No checkpoints found. Check 'data/model' directory.")
+        return
+
+    print(f"[VIS] Found full models: {len(full_ckpts)}  | head-only: {len(head_ckpts)}")
+    for sidx in sample_indices:
+        Dx, Dy = _load_test_sample(npz_path=npz_path, sample_idx=sidx)
+
+        # Full models
+        for name, seed, ckpt in full_ckpts:
+            try:
+                m = _build_full_from_name(name).to(device).eval()
+                m.load_state_dict(torch.load(ckpt, map_location=device), strict=True)
+                prefix = os.path.join(outdir, f"FULL_{name}_s{seed}_i{sidx}")
+                render_g1_maps(Dx, Dy, m, device, W=W, H=H, save_prefix=prefix,
+                               vmin=vmin, vmax=vmax, cmap_val=cmap_val, cmap_err=cmap_err)
+            except Exception as e:
+                print(f"[VIS][ERR][FULL] {name}_s{seed}: {e}")
+
+        # Head-only models (z=64)
+        for tag, seed, head_ckpt, enc_ckpt, hidden, act, dropout in head_ckpts:
+            try:
+                prefix = os.path.join(outdir, f"HEAD_{tag}_s{seed}_i{sidx}")
+                render_g1_maps_headonly(Dx, Dy, enc_ckpt, head_ckpt, z_dim=64,
+                                        head_hidden=hidden, act=act, dropout=dropout,
+                                        device=device, W=W, H=H, save_prefix=prefix,
+                                        vmin=vmin, vmax=vmax, cmap_val=cmap_val, cmap_err=cmap_err)
+            except Exception as e:
+                print(f"[VIS][ERR][HEAD] {tag}_s{seed}: {e}")
+
 if __name__ == "__main__":
-    main()
+    #main()
+    visualize_all_models(sample_indices=(7185,), outdir="vis_all", W=512, H=256)
