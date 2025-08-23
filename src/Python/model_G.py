@@ -276,126 +276,6 @@ class G1Dataset(Dataset):
     def __getitem__(self, index):
         return self.x[index], self.y[index]
 
-#-------train function for G1Model-------
-def G1_train():
-    #parameters
-    batch_size = 2048
-    learning_rate = 1e-3
-    epochs=500
-    input_dim=260
-    patience=25 # early stopping patience
-
-    # data
-    data=np.load("data/dataset/dataset_G_100k.npz")
-    x_data= data['x']
-    y_data= data['y']
-    
-    x_train, x_temp, y_train, y_temp = train_test_split(x_data, y_data, test_size=0.2, random_state=42)
-    x_val,   x_test, y_val,   y_test = train_test_split(x_temp,  y_temp,  test_size=0.5, random_state=42)
-
-    train_loader = DataLoader(G1Dataset(x_train, y_train), batch_size=batch_size, shuffle=True,  pin_memory=True)
-    val_loader   = DataLoader(G1Dataset(x_val,   y_val),   batch_size=batch_size, shuffle=False, pin_memory=True)
-    test_loader  = DataLoader(G1Dataset(x_test,  y_test),  batch_size=batch_size, shuffle=False, pin_memory=True)
-
-    # model
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #model = G1FCNN(input_dim).to(device)
-    #model = G1CNN(input_dim).to(device)
-    #model = G1CNN_GAP(input_dim).to(device)
-    #model = G1CNN_GAP_S(input_dim).to(device)
-    #model= G1Model_GAP().to(device)
-    
-    model = build_model(
-        z_dim=4,                 # 32/48/96/128...
-        head_hidden=(128, 64),    # (64) / (256,128)
-        angle_dim=4,
-        act="relu",               # "relu" or "silu"
-        dropout=0.0               
-        ).to(device)
-    
-    train_mode = "head"
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
-    if train_mode == "head":
-        full_sd = torch.load("data/model/model_G1_z4_100K.pth", map_location=device)
-        enc_sd = {k.replace("enc.",""): v for k, v in full_sd.items() if k.startswith("enc.")}
-        missing, unexpected = model.enc.load_state_dict(enc_sd, strict=False)
-
-        #freeze encoder
-        for p in model.enc.parameters():
-            p.requires_grad = False
-        
-        optimizer = optim.Adam(model.head.parameters(), lr=learning_rate)
-        
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6)
-    
-
-    #training
-    best_val= float('inf')
-    wait =0
-
-    for epoch in range(epochs):
-        model.train()
-        if train_mode == "head": 
-            model.enc.eval()
-        train_loss=0
-        for x_batch, y_batch in train_loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(x_batch)
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()*x_batch.size(0)
-
-        avg_train_loss =train_loss / len(train_loader.dataset)
-        
-        #validation
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for x_batch, y_batch in val_loader:
-                x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-                outputs = model(x_batch)
-                loss = criterion(outputs, y_batch)
-                val_loss += loss.item() * x_batch.size(0)
-
-        avg_val_loss = val_loss / len(val_loader.dataset)
-        scheduler.step(avg_val_loss)
-
-        lr_now = optimizer.param_groups[0]["lr"]
-        print(f"Epoch [{epoch}/{epochs}]  train={avg_train_loss:.8f}  val={avg_val_loss:.8f}  lr={lr_now:.2e}")
-
-        # Early stopping
-        if avg_val_loss < best_val:
-            best_val = avg_val_loss
-            wait = 0
-            torch.save(model.state_dict(), "data/model/model_G1_best.pth")
-        else:
-            wait += 1
-            if wait >= patience:
-                print(f"Early stop at epoch {epoch}")
-                break
-
-    #test
-    model.load_state_dict(torch.load("data/model/model_G1_best.pth", map_location=device))
-    model.eval()
-    test_loss_sum = 0.0
-    with torch.no_grad():
-        for xb, yb in test_loader:
-            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            pred = model(xb)
-            loss = criterion(pred, yb)
-            test_loss_sum += loss.item() * xb.size(0)
-    avg_test = test_loss_sum / len(test_loader.dataset)
-    print(f"Test Loss: {avg_test:.8f}")
-
-    return
-
-
 def test_environment():
     print("Python:", sys.version)
     print("Torch:", torch.__version__)
@@ -564,8 +444,43 @@ def run_all_experiments():
 
     print(f"\nAll done.\n - Per-run  -> {csv_runs}\n - Aggregate-> {csv_agg}")
 
+# ===== head-only search for z=64 (freeze encoder, train head) =====
+def run_head_search_z64():
+    z = 64
+    seeds = [0,1,2,3,4]
+    # use encoder checkpoints already trained as Encoder_64_s{seed}_best.pth
+    def head_tag(hidden, act, dropout):
+        h = "x".join(str(u) for u in hidden)
+        return f"HeadZ64_{h}_{act}_do{dropout:.2f}"
+    
+    HEAD_SPECS = [
+        ((128,64),      "relu", 0.00),
+        ((256,128),     "relu", 0.00),
+        ((256,128,64),  "relu", 0.00),
+        ((64,),         "relu", 0.00),
+        ((128,64),      "relu", 0.05),
+        ((128,64),      "relu", 0.10),
+        ((128,64),      "silu", 0.00),
+        ((192,96),      "silu", 0.05),
+    ]
+
+    for hidden, act, dropout in HEAD_SPECS:
+        tag = head_tag(hidden, act, dropout)
+        for s in seeds:
+            enc_ckpt = os.path.join("data", "model", f"Encoder_{z}_s{s}_best.pth")
+            if not os.path.exists(enc_ckpt):
+                print(f"[SKIP] {tag} seed={s}: missing encoder ckpt -> {enc_ckpt}")
+                continue
+            loaders = make_loaders(npz_path="data/dataset/dataset_G_100k.npz",
+                                   batch_size=2048, split_seed=42)
+            model = build_model(z_dim=z, head_hidden=hidden, act=act, dropout=dropout)
+            print(f"\n===== [RUN] {tag}  seed={s}  (freeze encoder; train head) =====")
+            train_once(model, loaders,
+                       tag=tag, seed=s, train_mode="head",
+                       lr=1e-3, epochs=500, patience=25,
+                       enc_ckpt=enc_ckpt, out_dir="data/model")
 
 if __name__ == "__main__":
-    #G1_train()
     #test_environment()
-    run_all_experiments()
+    #run_all_experiments()
+    run_head_search_z64()

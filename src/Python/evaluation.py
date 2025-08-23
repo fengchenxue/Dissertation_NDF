@@ -5,7 +5,7 @@ import torch.nn as nn
 from sklearn.model_selection import train_test_split
 import ndf_py as _ndf
 import model_G
-
+import re
 # Make single-thread CPU runs stable/reproducible
 torch.set_num_threads(1)
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -31,6 +31,44 @@ def _stats(arr):
         "p95_ms":  float(np.percentile(arr, 95)),
         "n":       len(arr),
     }
+
+def extract_head_tag_from_filename(fn: str) -> str | None:
+    """
+    Accept filenames like:
+      HeadZ64_128x64_relu_do0.00_s3_best.pth
+      HeadZ64_128x64_relu_do0_s0_best.pth
+      HeadZ64_256x128x64_silu_do0.05_s4_best.pth
+    Return the tag part (without seed/suffix) or None if not matched.
+    """
+    m = re.match(
+        r'^(HeadZ64_[^_]+_(?:relu|silu)_do[0-9]+(?:\.[0-9]+)?)_s[0-9]+_best\.pth$',
+        fn
+    )
+    return m.group(1) if m else None
+
+
+def parse_head_tag(tag: str):
+    """
+    Parse 'HeadZ64_<h1>x<h2>x..._<act>_do<dropout>'
+    Examples:
+      HeadZ64_128x64_relu_do0
+      HeadZ64_128x64_relu_do0.00
+      HeadZ64_256x128x64_silu_do0.05
+    """
+    m = re.match(
+        r'^HeadZ64_(?P<h>\d+(?:x\d+)*)_(?P<act>relu|silu)_do(?P<do>[0-9]+(?:\.[0-9]+)?)$',
+        tag
+    )
+    if not m:
+        raise ValueError(
+            f"Invalid head tag: '{tag}'. Expected "
+            "'HeadZ64_<h1>x<h2>..._<act>_do<dropout>' "
+            "(e.g., HeadZ64_128x64_relu_do0.00)"
+        )
+    hidden = tuple(int(x) for x in m.group("h").split("x"))
+    act = m.group("act")
+    dropout = float(m.group("do"))
+    return hidden, act, dropout
 
 # ---------- Traditional G1 (C++ via pybind) ----------
 
@@ -356,10 +394,12 @@ class _HeadOnly(nn.Module):
         z     = az[:, self.angle_dim:].contiguous()
         return self.head(z, angle)
 
-def build_head_only_from_ckpt(ckpt_path: str, z_dim: int, angle_dim=4):
-    """Load a full checkpoint, extract the head, disable inplace, return a head-only module."""
+def build_head_only_from_ckpt(ckpt_path: str, z_dim: int,
+                              angle_dim=4, head_hidden=(128,64),
+                              act="relu", dropout=0.0):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    full = model_G.build_model(z_dim=z_dim, head_hidden=(128,64), act="relu", dropout=0.0)
+    full = model_G.build_model(z_dim=z_dim, head_hidden=head_hidden,
+                               act=act, dropout=dropout)
     full.load_state_dict(torch.load(ckpt_path, map_location=dev), strict=True)
     head = full.head.to(dev).eval()
     disable_inplace(head)
@@ -756,6 +796,86 @@ def main():
         cpu_agg = aggregate_bench_results(cpu_runs)
         pretty_print_agg(f"[HEAD-ONLY] Encoder_{chosen_z} | CPU device-only fp32 (seeds={len(chosen_ckpts)})",
                          torch.device("cpu"), count_params(build_head_only_from_ckpt(chosen_ckpts[0], chosen_z)), cpu_agg)
+
+
+  # ====== head-search evaluation (z=64) ======
+    print("\n" + "="*80)
+    print(">>> HEAD-SEARCH (z=64) evaluation on test split <<<")
+
+    # collect all head ckpts of the naming pattern
+    model_dir = os.path.join("data", "model")
+    all_files = [fn for fn in os.listdir(model_dir)
+             if fn.startswith("HeadZ64_") and fn.endswith("_best.pth")]
+
+    # collect valid tags
+    head_tags = []
+    seen = set()
+    for fn in all_files:
+        tag = extract_head_tag_from_filename(fn)
+        if tag is None:
+            print(f"[WARN] skip (bad name): {fn}")
+            continue
+        try:
+            parse_head_tag(tag)  # validate
+            if tag not in seen:
+                head_tags.append(tag)
+                seen.add(tag)
+        except ValueError as e:
+            print(f"[WARN] skip (bad tag): {fn} -> {e}")
+
+    # ensure z-cache for Encoder_64
+    caches = {}
+    for s in [0,1,2,3,4]:
+        enc_ckpt = os.path.join("data","model", f"Encoder_64_s{s}_best.pth")
+        cache = os.path.join("data","model", f"zcache_Encoder_64_s{s}.npz")
+        if os.path.exists(enc_ckpt) and not os.path.exists(cache):
+            precompute_z_cache(enc_ckpt, 64, x_te, y_te, cache, angle_dim=4, batch=4096)
+        if os.path.exists(cache):
+            caches[s] = cache
+
+    for tag in head_tags:
+        hidden, act, dropout = parse_head_tag(tag)
+        # gather seeds
+        ckpts = []
+        for s in [0,1,2,3,4]:
+            p = os.path.join("data","model", f"{tag}_s{s}_best.pth")
+            if os.path.exists(p) and s in caches:
+                ckpts.append((s, p, caches[s]))
+        if not ckpts:
+            print(f"[HEAD-SEARCH][SKIP] {tag}: no ckpt or no z-cache")
+            continue
+
+        # accuracy
+        maes, rmses, p95s, hi_maes = [], [], [], []
+        for s, p, cache in ckpts:
+            head_only = build_head_only_from_ckpt(p, z_dim=64,
+                                head_hidden=hidden, act=act, dropout=dropout).to(device_cpu).eval()
+            M = eval_headonly_metrics(head_only, cache)
+            maes.append(M["MAE"]); rmses.append(M["RMSE"])
+            p95s.append(M["P95"]); hi_maes.append(M["HighThetaMAE"])
+            print(f"[HEAD-SEARCH][{tag}][seed={s}] MAE={M['MAE']:.8f}  RMSE={M['RMSE']:.8f}  "
+                  f"P95={M['P95']:.8f}  HighThetaMAE={M['HighThetaMAE']:.8f}")
+
+        m = lambda a:(float(statistics.mean(a)), float(statistics.pstdev(a)) if len(a)>1 else 0.0)
+        mae_m, mae_s = m(maes); rmse_m, rmse_s = m(rmses); p95_m, p95_s = m(p95s); htm_m, htm_s = m(hi_maes)
+        print(f"[HEAD-SEARCH][AGG][{tag}] seeds={len(ckpts)}  "
+              f"MAE={mae_m:.8f}+/-{mae_s:.8f}  RMSE={rmse_m:.8f}+/-{rmse_s:.8f}  "
+              f"P95={p95_m:.8f}+/-{p95_s:.8f}  HighTheta={htm_m:.8f}+/-{htm_s:.8f}")
+
+        # speed (CPU device-only; batch=1 & 2048)
+        cpu_runs = []
+        for s, p, cache in ckpts:
+            head_only = build_head_only_from_ckpt(p, z_dim=64,
+                            head_hidden=hidden, act=act, dropout=dropout).to(device_cpu).eval()
+            sample_src = make_head_sample_source(cache)
+            r = run_benchmark(head_only, device_cpu,
+                              batch_sizes=(1,2048), repeats=300, warmup=80,
+                              measure="device_only", use_amp=False,
+                              sample_source=sample_src)
+            cpu_runs.append(r)
+        cpu_agg = aggregate_bench_results(cpu_runs)
+        pretty_print_agg(f"[HEAD-SEARCH]{tag} | CPU device-only fp32", device_cpu,
+                         count_params(head_only), cpu_agg)
 
 if __name__ == "__main__":
     main()
