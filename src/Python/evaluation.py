@@ -488,7 +488,7 @@ def eval_headonly_metrics(head_model: nn.Module, z_cache_path: str, high_theta_t
 
 @torch.inference_mode()
 def render_g1_maps(ndf_dx, ndf_dy, nn_model, device, W=256, H=128, save_prefix="vis",
-                   vmin=0.0, vmax=1.0, cmap_val="inferno", cmap_err="magma"):
+                   vmin=0.0, vmax=1.0, cmap_val="inferno", cmap_err="magma", err_vmax=None):
     """
     Render G1(theta,phi) heatmaps for a given NDF using a FULL model that takes 260-D input,
     and compare against the traditional C++ implementation. Saves a side-by-side PNG.
@@ -518,7 +518,11 @@ def render_g1_maps(ndf_dx, ndf_dy, nn_model, device, W=256, H=128, save_prefix="
     extent = [0, 360, 0, 90]  # phi deg, theta deg
     im0 = axs[0].imshow(y_nn, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap_val, extent=extent, aspect="auto"); axs[0].set_title("NN G1")
     im1 = axs[1].imshow(y_tr, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap_val, extent=extent, aspect="auto"); axs[1].set_title("Traditional G1")
-    im2 = axs[2].imshow(err,  origin="lower", cmap=cmap_err, extent=extent, aspect="auto"); axs[2].set_title(f"|err|  MAE={mae:.3f}, P95={p95:.3f}")
+    im2 = axs[2].imshow(err, origin="lower",
+                        vmin=0.0 if err_vmax is not None else None,
+                        vmax=err_vmax,
+                        cmap=cmap_err, extent=extent, aspect="auto")
+    axs[2].set_title(f"|err|  MAE={mae:.3f}, P95={p95:.3f}")
     for ax in axs:
         ax.set_xlabel("phi(deg)")
     axs[0].set_ylabel("theta(deg)")
@@ -536,7 +540,7 @@ def render_g1_maps(ndf_dx, ndf_dy, nn_model, device, W=256, H=128, save_prefix="
 def render_g1_maps_headonly(ndf_dx, ndf_dy, enc_ckpt_path: str, head_ckpt_path: str,
                             z_dim=64, head_hidden=(256,128), act="relu", dropout=0.0,
                             device=None, W=256, H=128, save_prefix="vis_head",
-                            vmin=0.0, vmax=1.0, cmap_val="inferno", cmap_err="magma"):
+                            vmin=0.0, vmax=1.0, cmap_val="inferno", cmap_err="magma",err_vmax=None):
     """
     Render G1(theta,phi) using HEAD-ONLY path (angle + z), compare with traditional.
     - enc_ckpt_path: Encoder_64_sX_best.pth
@@ -584,7 +588,11 @@ def render_g1_maps_headonly(ndf_dx, ndf_dy, enc_ckpt_path: str, head_ckpt_path: 
     extent = [0, 360, 0, 90]
     im0 = axs[0].imshow(y_nn, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap_val, extent=extent, aspect="auto"); axs[0].set_title("NN G1 (head-only)")
     im1 = axs[1].imshow(y_tr, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap_val, extent=extent, aspect="auto"); axs[1].set_title("Traditional G1")
-    im2 = axs[2].imshow(err,  origin="lower", cmap=cmap_err, extent=extent, aspect="auto"); axs[2].set_title(f"|err|  MAE={mae:.3f}, P95={p95:.3f}")
+    im2 = axs[2].imshow(err, origin="lower",
+                        vmin=0.0 if err_vmax is not None else None,
+                        vmax=err_vmax,
+                        cmap=cmap_err, extent=extent, aspect="auto")
+    axs[2].set_title(f"|err|  MAE={mae:.3f}, P95={p95:.3f}")
     for ax in axs:
         ax.set_xlabel("phi(deg)")
     axs[0].set_ylabel("theta(deg)")
@@ -595,6 +603,50 @@ def render_g1_maps_headonly(ndf_dx, ndf_dy, enc_ckpt_path: str, head_ckpt_path: 
     plt.savefig(out, dpi=200); plt.close()
     print(f"[VIS] saved -> {out}")
 
+def _compute_error_max_for_sample(Dx, Dy, full_ckpts, head_ckpts, device, W=256, H=128, pctl=99.0):
+    import numpy as np, torch
+    # angle grid
+    theta = np.linspace(0, np.pi/2, H, endpoint=True, dtype=np.float32)
+    phi   = np.linspace(0, 2*np.pi,  W, endpoint=False, dtype=np.float32)
+    TT, PP = np.meshgrid(theta, phi, indexing="ij")
+    ANG = np.stack([np.cos(TT), np.sin(TT), np.cos(PP), np.sin(PP)], axis=-1).reshape(-1, 4).astype(np.float32)
+
+    # traditional reference
+    Dx_t = np.broadcast_to(Dx.reshape(1,-1), (ANG.shape[0], 128))
+    Dy_t = np.broadcast_to(Dy.reshape(1,-1), (ANG.shape[0], 128))
+    X260 = np.concatenate([ANG, Dx_t, Dy_t], axis=1).astype(np.float32)
+    y_tr = g1_traditional_eval(X260).reshape(H, W)
+
+    errs = []
+
+    # full models
+    for name, seed, ckpt in full_ckpts:
+        m = _build_full_from_name(name).to(device).eval()
+        m.load_state_dict(torch.load(ckpt, map_location=device), strict=True)
+        with torch.inference_mode():
+            y_nn = m(torch.from_numpy(X260).to(device)).cpu().numpy().reshape(H, W)
+        errs.append(np.abs(y_nn - y_tr).ravel())
+
+    # head-only
+    for tag, seed, head_ckpt, enc_ckpt, hidden, act, dropout in head_ckpts:
+        # get z from encoder
+        full_for_enc = model_G.build_model(z_dim=64, head_hidden=(128,64), act="relu", dropout=0.0).to(device).eval()
+        full_for_enc.load_state_dict(torch.load(enc_ckpt, map_location=device), strict=True)
+        seq = torch.from_numpy(np.stack([Dx, Dy], axis=0).astype(np.float32)).unsqueeze(0).to(device)
+        z = full_for_enc.enc(seq).detach().cpu().numpy().reshape(1, -1)
+        AZ = np.concatenate([ANG, np.repeat(z, ANG.shape[0], axis=0)], axis=1).astype(np.float32)
+        # head prediction
+        head_full = model_G.build_model(z_dim=64, head_hidden=hidden, act=act, dropout=dropout)
+        head_full.load_state_dict(torch.load(head_ckpt, map_location="cpu"), strict=True)
+        head_only = _HeadOnly(head_full.head, angle_dim=4).to(device).eval()
+        disable_inplace(head_only)
+        with torch.inference_mode():
+            y_nn = head_only(torch.from_numpy(AZ).to(device)).cpu().numpy().reshape(H, W)
+        errs.append(np.abs(y_nn - y_tr).ravel())
+
+    all_err = np.concatenate(errs, axis=0)
+
+    return float(np.percentile(all_err, pctl))
 
 
 def main():
@@ -1131,6 +1183,7 @@ def visualize_all_models(sample_indices=(0,), outdir="vis_all", W=256, H=128,
     print(f"[VIS] Found full models: {len(full_ckpts)}  | head-only: {len(head_ckpts)}")
     for sidx in sample_indices:
         Dx, Dy = _load_test_sample(npz_path=npz_path, sample_idx=sidx)
+        err_vmax = _compute_error_max_for_sample(Dx, Dy, full_ckpts, head_ckpts, device, W, H, pctl=99.0)
 
         # Full models
         for name, seed, ckpt in full_ckpts:
@@ -1139,7 +1192,7 @@ def visualize_all_models(sample_indices=(0,), outdir="vis_all", W=256, H=128,
                 m.load_state_dict(torch.load(ckpt, map_location=device), strict=True)
                 prefix = os.path.join(outdir, f"FULL_{name}_s{seed}_i{sidx}")
                 render_g1_maps(Dx, Dy, m, device, W=W, H=H, save_prefix=prefix,
-                               vmin=vmin, vmax=vmax, cmap_val=cmap_val, cmap_err=cmap_err)
+                               vmin=vmin, vmax=vmax, cmap_val=cmap_val, cmap_err=cmap_err,err_vmax=err_vmax)
             except Exception as e:
                 print(f"[VIS][ERR][FULL] {name}_s{seed}: {e}")
 
@@ -1150,7 +1203,7 @@ def visualize_all_models(sample_indices=(0,), outdir="vis_all", W=256, H=128,
                 render_g1_maps_headonly(Dx, Dy, enc_ckpt, head_ckpt, z_dim=64,
                                         head_hidden=hidden, act=act, dropout=dropout,
                                         device=device, W=W, H=H, save_prefix=prefix,
-                                        vmin=vmin, vmax=vmax, cmap_val=cmap_val, cmap_err=cmap_err)
+                                        vmin=vmin, vmax=vmax, cmap_val=cmap_val, cmap_err=cmap_err,err_vmax=err_vmax)
             except Exception as e:
                 print(f"[VIS][ERR][HEAD] {tag}_s{seed}: {e}")
 
