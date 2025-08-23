@@ -1207,6 +1207,167 @@ def visualize_all_models(sample_indices=(0,), outdir="vis_all", W=256, H=128,
             except Exception as e:
                 print(f"[VIS][ERR][HEAD] {tag}_s{seed}: {e}")
 
+# ==========Traditional G1 LUT baking (ground truth)============
+def sample_g1_lut_bilinear(lut: np.ndarray,
+                           theta_vals: np.ndarray,
+                           phi_vals: np.ndarray,
+                           theta: np.ndarray,
+                           phi: np.ndarray) -> np.ndarray:
+    """
+    Bilinear sample of the LUT at arrays of (theta, phi).
+    theta_vals: (Ntheta,) in [0, pi/2], ascending (non-uniform allowed, we searchsorted)
+    phi_vals:   (Nphi,)   in [0, 2pi), uniform spacing, periodic wrap
+    theta,phi:  (...,) query coordinates
+    Returns:    (...,) sampled values
+    """
+    Ntheta, Nphi = lut.shape
+    theta = theta.reshape(-1).astype(np.float32)
+    # periodic wrap for phi
+    period = (phi_vals[-1] - phi_vals[0]) + (phi_vals[1] - phi_vals[0])
+    phi = (phi.reshape(-1).astype(np.float32) - phi_vals[0]) % period + phi_vals[0]
+
+    # --- theta axis (non-uniform) ---
+    it1 = np.searchsorted(theta_vals, theta, side="right")
+    it0 = np.clip(it1 - 1, 0, Ntheta - 2)
+    it1 = np.clip(it1,     1, Ntheta - 1)
+    t0 = theta_vals[it0]; t1 = theta_vals[it1]
+    ft = np.where(t1 > t0, (theta - t0) / (t1 - t0), 0.0)
+
+    # --- phi axis (uniform + periodic) ---
+    dphi = (phi_vals[1] - phi_vals[0]).astype(np.float32)
+    ip0 = np.floor((phi - phi_vals[0]) / dphi).astype(np.int64) % Nphi
+    ip1 = (ip0 + 1) % Nphi
+    p0 = phi_vals[0] + ip0 * dphi
+    fp = (phi - p0) / dphi
+
+    # gather 4 neighbors
+    v00 = lut[it0, ip0]; v10 = lut[it1, ip0]
+    v01 = lut[it0, ip1]; v11 = lut[it1, ip1]
+    out = (1 - ft) * (1 - fp) * v00 + ft * (1 - fp) * v10 + (1 - ft) * fp * v01 + ft * fp * v11
+    return out.reshape(-1)
+
+def evaluate_g1_lut_against_traditional(Dx: np.ndarray, Dy: np.ndarray,
+                                        lut: np.ndarray,
+                                        theta_vals: np.ndarray, phi_vals: np.ndarray,
+                                        W=256, H=128) -> dict:
+    """
+    Compare LUT sampling against traditional C++ G1 on an angle image grid.
+    Returns MAE / P95 / HighThetaMAE (theta>=1.2 rad) and N.
+    """
+    theta = np.linspace(0, np.pi/2, H, endpoint=True, dtype=np.float32)
+    phi   = np.linspace(0, 2*np.pi,  W, endpoint=False, dtype=np.float32)
+    TT, PP = np.meshgrid(theta, phi, indexing="ij")  # (H,W)
+
+    # Traditional reference
+    ANG = np.stack([np.cos(TT), np.sin(TT), np.cos(PP), np.sin(PP)], axis=-1).reshape(-1, 4).astype(np.float32)
+    Dx_t = np.broadcast_to(Dx.reshape(1, -1), (ANG.shape[0], 128))
+    Dy_t = np.broadcast_to(Dy.reshape(1, -1), (ANG.shape[0], 128))
+    X260 = np.concatenate([ANG, Dx_t, Dy_t], axis=1).astype(np.float32)
+    y_tr = g1_traditional_eval(X260).reshape(H, W)
+
+    # LUT sampling
+    y_lut = sample_g1_lut_bilinear(lut, theta_vals, phi_vals, TT.reshape(-1), PP.reshape(-1)).reshape(H, W)
+
+    err = np.abs(y_lut - y_tr).astype(np.float32)
+    mae = float(err.mean())
+    p95 = float(np.percentile(err, 95))
+    hi_mask = TT >= 1.2
+    hi_mae = float(err[hi_mask].mean()) if np.any(hi_mask) else float("nan")
+    return {"MAE": mae, "P95": p95, "HighThetaMAE": hi_mae, "N": int(err.size)}
+
+def benchmark_lut_sampling(lut: np.ndarray, theta_vals: np.ndarray, phi_vals: np.ndarray,
+                           bs_list=(1, 2048), repeats=300, warmup=80, seed=0) -> dict:
+    """
+    CPU-only timing of LUT bilinear sampling. Returns per-batch timing stats.
+    """
+    rng = np.random.default_rng(seed)
+    res = {}
+    for bs in bs_list:
+        # warmup
+        for _ in range(warmup):
+            th = rng.random(bs, dtype=np.float32) * (np.pi/2)
+            ph = rng.random(bs, dtype=np.float32) * (2*np.pi)
+            _  = sample_g1_lut_bilinear(lut, theta_vals, phi_vals, th, ph)
+        # measure
+        times = []
+        for _ in range(repeats):
+            th = rng.random(bs, dtype=np.float32) * (np.pi/2)
+            ph = rng.random(bs, dtype=np.float32) * (2*np.pi)
+            t0 = time.perf_counter()
+            _  = sample_g1_lut_bilinear(lut, theta_vals, phi_vals, th, ph)
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000.0)
+        t = np.array(times, dtype=np.float64)
+        res[bs] = {
+            "mean": float(t.mean()),
+            "p50":  float(np.median(t)),
+            "p95":  float(np.percentile(t, 95)),
+            "throughput": float(bs / (t.mean() / 1000.0)),
+        }
+    return res
+
+def evaluate_truth_g1_lut(sample_idx=7185):
+    """
+    Minimal appendix-style report for Truth G-LUT:
+    - size (KiB), bake time
+    - MAE / P95 / HighThetaMAE vs. traditional G1
+    - sampling latency/throughput (BS=1, 2048)
+    """
+    Dx, Dy = _load_test_sample(sample_idx=sample_idx)
+    for (Nh, Nw) in [(64, 64), (128, 64), (256, 128)]:
+        lut, thv, phv, bake_t = bake_truth_g1_lut(Dx, Dy, Ntheta=Nh, Nphi=Nw, fp16=True)
+        acc = evaluate_g1_lut_against_traditional(Dx, Dy, lut, thv, phv, W=256, H=128)
+        bmk = benchmark_lut_sampling(lut, thv, phv, bs_list=(1, 2048))
+        kib = lut.size * (2 if lut.dtype == np.float16 else 4) / 1024.0
+        print(f"[Truth G-LUT] {Nh}x{Nw}  size={kib:.1f} KiB  bake={bake_t*1000:.2f} ms  "
+              f"| MAE={acc['MAE']:.5f}  P95={acc['P95']:.5f}  Highheta={acc['HighThetaMAE']:.5f}")
+        for bs, s in bmk.items():
+            print(f"              sample bs={bs:<4d} mean={s['mean']:.4f} ms  p50={s['p50']:.4f}  "
+                  f"p95={s['p95']:.4f}  thr={s['throughput']:.0f}/s")
+
+
+
+@torch.inference_mode()
+def bake_truth_g1_lut(Dx, Dy, Ntheta=128, Nphi=64, fp16=True, phi_period=2*math.pi):
+    """
+    Bake a G1 LUT using the TRADITIONAL implementation (ground truth).
+    Theta grid is uniform in cos(theta); Phi is uniform in [0, 2pi).
+    Returns: lut, theta_vals, phi_vals, bake_time_sec
+    """
+    cos_t = np.linspace(1.0, 0.0, Ntheta, dtype=np.float32)   # 1..0 (cos theta)
+    theta_vals = np.arccos(np.clip(cos_t, 0.0, 1.0))          # 0..pi/2
+    phi_vals   = np.linspace(0.0, phi_period, Nphi, endpoint=False, dtype=np.float32)
+
+    TT, PP = np.meshgrid(theta_vals, phi_vals, indexing="ij") 
+    ANG = np.stack([np.cos(TT), np.sin(TT), np.cos(PP), np.sin(PP)], axis=-1).reshape(-1,4).astype(np.float32)
+
+    Dx_t = np.broadcast_to(Dx.reshape(1,-1), (ANG.shape[0], 128))
+    Dy_t = np.broadcast_to(Dy.reshape(1,-1), (ANG.shape[0], 128))
+    X260 = np.concatenate([ANG, Dx_t, Dy_t], axis=1).astype(np.float32)
+
+    t0 = time.perf_counter()
+    y  = g1_traditional_eval(X260).reshape(Ntheta, Nphi)      # your existing C++ binding
+    t1 = time.perf_counter()
+
+    lut = y.astype(np.float16) if fp16 else y.astype(np.float32)
+    return lut, theta_vals.astype(np.float32), phi_vals.astype(np.float32), (t1 - t0)
+
+
+def evaluate_truth_g1_lut(sample_idx=7185):
+    Dx, Dy = _load_test_sample(sample_idx=sample_idx)
+
+    for (Nh, Nw) in [(64,64), (128,64), (256,128)]:
+        lut, thv, phv, bake_t = bake_truth_g1_lut(Dx, Dy, Ntheta=Nh, Nphi=Nw, fp16=True)
+        acc = evaluate_g1_lut_against_traditional(Dx, Dy, lut, thv, phv, W=512, H=256)
+        bmk = benchmark_lut_sampling(lut, thv, phv, bs_list=(1,2048))
+
+        kb = lut.size * (2 if lut.dtype==np.float16 else 4) / 1024.0
+        print(f"[Truth G-LUT] {Nh}x{Nw}  size={kb:.1f}KB  bake={bake_t*1000:.2f}ms  "
+              f"| MAE={acc['MAE']:.5f}  P95={acc['P95']:.5f}  HighTheta={acc['HighThetaMAE']:.5f}")
+        for bs, s in bmk.items():
+            print(f"             sample bs={bs:<4d} mean={s['mean']:.4f}ms p50={s['p50']:.4f} p95={s['p95']:.4f} thr={s['throughput']:.0f}/s")
+
 if __name__ == "__main__":
-    #main()
-    visualize_all_models(sample_indices=(7185,), outdir="vis_all", W=512, H=256)
+    main()
+    #visualize_all_models(sample_indices=(7185,), outdir="vis_all", W=512, H=256)
+    evaluate_truth_g1_lut(sample_idx=7185)
