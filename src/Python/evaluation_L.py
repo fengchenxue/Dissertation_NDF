@@ -5,12 +5,10 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import model_L
+from model_L import L2LowRankHead
 
 @torch.no_grad()
 def eval_l2lowrank(npz_path, ckpt_path, device=None):
-    import torch, numpy as np
-    from model_G import L2LowRankHead
     device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
 
     d = np.load(npz_path)

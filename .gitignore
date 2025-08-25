@@ -47,7 +47,7 @@ Desktop.ini
 __pycache__/
 data/model/
 vis_all/
-
+src/Python/Release/
 # macOS
 .DS_Store
 

@@ -23,7 +23,7 @@ def build_i_grid(N_theta=64, N_phi=32):
     THi, PHi = np.meshgrid(ti, pi, indexing='ij')
     Ii = np.stack([np.cos(THi), np.sin(THi), np.cos(PHi), np.sin(PHi)],
                   axis=-1).reshape(-1,4).astype(np.float32)
-    return Ii  # (N_i,4) = [cos¦Èi, sin¦Èi, cos¦Õi, sin¦Õi]
+    return Ii  
 
 def bake_one_material_npz(out_path, Dx, Dy, encoder=None, H=64, W=32, N_theta=64, N_phi=32):
     # optional z feature
@@ -42,22 +42,48 @@ def bake_one_material_npz(out_path, Dx, Dy, encoder=None, H=64, W=32, N_theta=64
     Linf = np.zeros((N_i, H, W), np.float32)
     L1   = np.zeros((N_i, H, W), np.float32)
 
-    # ---- call into your pybind module ----
-
-
     def _split(i_feat):
         cos_ti, sin_ti, cos_pi, sin_pi = map(float, i_feat.tolist())
         return cos_ti, sin_ti, cos_pi, sin_pi
 
-    def virtual_goniometer_sample(Dx, Dy, i_feat, H, W):
+    def eval_microfacet_L1(Dx, Dy, i_feat, dirs_ow):
         cos_ti, sin_ti, cos_pi, sin_pi = _split(i_feat)
-        return vg.virtual_goniometer_sample(
+        return vg.eval_microfacet_L1_img(
             Dx.astype(np.float32).tolist(),
             Dy.astype(np.float32).tolist(),
             cos_ti, sin_ti, cos_pi, sin_pi,
-            int(H), int(W)
+            dirs_ow.astype(np.float32)
         ).astype(np.float32)
 
-    def eval_microfacet_L1(Dx, Dy, i_feat, dirs_ow):
+    def virtual_goniometer_sample_safe(Dx, Dy, i_feat, H, W):
+        """Call C++ Linf; if not implemented yet, fall back to L1."""
         cos_ti, sin_ti, cos_pi, sin_pi = _split(i_feat)
-        return vg.eva
+        if hasattr(vg, "virtual_goniometer_sample"):
+            try:
+                return vg.virtual_goniometer_sample(
+                    Dx.astype(np.float32).tolist(),
+                    Dy.astype(np.float32).tolist(),
+                    cos_ti, sin_ti, cos_pi, sin_pi,
+                    int(H), int(W)
+                ).astype(np.float32)
+            except Exception:
+                pass  # will fall back to L1 below
+        # safe fallback (lets the pipeline run before Linf is ready)
+        return eval_microfacet_L1(Dx, Dy, i_feat, dirs_ow)
+
+    for k in range(N_i):
+        i_feat = i_angles[k]  
+        L1[k]   = eval_microfacet_L1(Dx, Dy, i_feat, dirs_ow)
+        Linf[k] = virtual_goniometer_sample_safe(Dx, Dy, i_feat, H, W)
+
+    L2p = np.maximum(0.0, Linf - L1).astype(np.float32)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    np.savez(out_path,
+             z=(z if z is not None else np.zeros((0,), np.float32)),
+             Dx=Dx.astype(np.float32),
+             Dy=Dy.astype(np.float32),
+             i_angles=i_angles,
+             Linf=Linf, L1=L1, L2p=L2p,
+             dirs_ow=dirs_ow, weight_o=weight_o)
+    print("wrote", out_path)

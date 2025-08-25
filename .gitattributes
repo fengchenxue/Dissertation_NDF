@@ -1,0 +1,6 @@
+* text=auto
+
+
+*.{h,hpp,cpp,cc,cxx} text eol=lf
+
+external/** -text

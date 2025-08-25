@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from model_L import L2LowRankHead 
 
 # ===== L2+ Neural Low-Rank Head =====
 class L2LowRankHead(nn.Module):
