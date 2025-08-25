@@ -1,7 +1,10 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h> 
-#include "Microfacet.hpp"
+#include <pybind11/numpy.h>
 #include "Math.hpp"            
+#include "GonioSensor.hpp"
+#include "Microfacet.hpp"
+#include "modules/virtualgoniolib/src/NDFs/PiecewiseLinear.cpp"
 
 namespace py = pybind11;
 
