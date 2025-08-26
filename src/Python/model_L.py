@@ -8,11 +8,6 @@ from torch.utils.data import Dataset, DataLoader
 
 # ===== L2+ Neural Low-Rank Head =====
 class L2LowRankHead(nn.Module):
-    """
-    Neural low-rank: L2+(i,o) ¡Ö ¦²_r a_r(z,i,ndf_feat) * b_r(o).
-    - b_r(o): learnable outgoing bases over hemisphere grid (R,H,W), shared by all materials.
-    - a_r(...): small MLP mapping from (z and/or NDF features, i-feat) to R non-negative coefficients.
-    """
     def __init__(self, z_dim=64, R=8, H=64, W=32,
                  use_z=True,
                  use_ndf_pca=False, ndf_pca_dim=16,     # Dx_pca + Dy_pca = 2*ndf_pca_dim
