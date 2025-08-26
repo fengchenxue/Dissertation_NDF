@@ -73,10 +73,29 @@ def parse_head_tag(tag: str):
 
 # ---------- Traditional G1 (C++ via pybind) ----------
 
-def g1_traditional_eval(X_np: np.ndarray) -> np.ndarray:
-    if not hasattr(_ndf, "G1"):
-        raise RuntimeError("ndf_py G1 binding is missing please build wrapper with G1 exposed.")
-    return _ndf.G1(X_np.astype(np.float32))
+def g1_traditional_eval(X_np):
+    """
+    X_np: (B, 260) float32 = [cosT, sinT, cosP, sinP, Dx(128), Dy(128)]
+    Returns: (B,) float32
+    """
+    
+    if hasattr(_ndf, "G1_batch"):
+        y = _ndf.G1_batch(X_np.astype(np.float32))
+        return np.asarray(y, dtype=np.float32).reshape(-1)
+    else:
+        # Fallback: per-sample loop (good for BS=1 latency; slower for large BS)
+        B, C = X_np.shape
+        nc = (C - 4) // 2
+        y = np.empty((B,), dtype=np.float32)
+        wh = _ndf.Vec3f(0.0, 0.0, 1.0)
+        for i in range(B):
+            cos_t, sin_t, cos_p, sin_p = X_np[i, :4]
+            Dx = X_np[i, 4:4 + nc].tolist()
+            Dy = X_np[i, 4 + nc:4 + 2 * nc].tolist()
+            w = _ndf.Vec3f(float(sin_t * cos_p), float(sin_t * sin_p), float(cos_t))
+            ndf = _ndf.PiecewiseLinearNDF(Dx, Dy)
+            y[i] = float(ndf.G1(w, wh))
+        return y
 
 def benchmark_traditional_g1(sample_source, batch_sizes=(1, 2048), repeats=200, warmup=50):
     """
@@ -656,7 +675,7 @@ def main():
             z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0))
         for z in [128,64,32,16,8,4,2,1,0]
     ]
-    '''
+    
     # ====== full model evaluation ======
     results_table = []  
     for name, ctor in MODEL_SPECS:
@@ -900,7 +919,7 @@ def main():
                 gpu_split_runs.append(r)
             gpu_split_agg = aggregate_bench_results(gpu_split_runs)
             pretty_print_agg(f"[HEAD-ONLY]{name} | GPU split fp32 (BS=1, seeds={len(caches)})", device_gpu, params_ref, gpu_split_agg)
-'''
+
  # ----- Traditional G1 CPU benchmark (fair CPU-vs-CPU) -----
     print("\n" + "="*80)
     print(">>> Traditional G1 (C++ via pybind) vs head-only (CPU) <<<")
@@ -942,7 +961,7 @@ def main():
         pretty_print_agg(f"[HEAD-ONLY] Encoder_{chosen_z} | CPU device-only fp32 (seeds={len(chosen_ckpts)})",
                          torch.device("cpu"), count_params(build_head_only_from_ckpt(chosen_ckpts[0], chosen_z)), cpu_agg)
 
-'''
+
   # ====== head-search evaluation (z=64) ======
     print("\n" + "="*80)
     print(">>> HEAD-SEARCH (z=64) evaluation on test split <<<")
@@ -1021,7 +1040,7 @@ def main():
         cpu_agg = aggregate_bench_results(cpu_runs)
         pretty_print_agg(f"[HEAD-SEARCH]{tag} | CPU device-only fp32", device_cpu,
                          count_params(head_only), cpu_agg)
-        '''
+
 def render_case_full(model_name="Encoder_64", seed=0, sample_idx=0, out="vis_full"):
     npz = np.load("data/dataset/dataset_G_100k.npz")
     x, y = npz["x"], npz["y"]
@@ -1351,4 +1370,4 @@ def evaluate_truth_g1_lut(sample_idx=7185):
 if __name__ == "__main__":
     main()
     #visualize_all_models(sample_indices=(7185,), outdir="vis_all", W=512, H=256)
-    #evaluate_truth_g1_lut(sample_idx=7185)
+    evaluate_truth_g1_lut(sample_idx=7185)

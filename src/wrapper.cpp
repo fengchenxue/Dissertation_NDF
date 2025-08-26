@@ -1,17 +1,14 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h> 
-#include <pybind11/numpy.h>
-#include "Math.hpp"            
-#include "GonioSensor.hpp"
 #include "Microfacet.hpp"
-#include "modules/virtualgoniolib/src/NDFs/PiecewiseLinear.cpp"
+#include "Math.hpp"            
 
 namespace py = pybind11;
 
 
 PYBIND11_MODULE(ndf_py, m) {
     m.doc() = "Python bindings for generating dataset of machine learning";
-    
+
     //Vec2f
     py::class_<Vec2f>(m, "Vec2f")
         .def(py::init<float, float>(), "Constructor for a 2D vector")
