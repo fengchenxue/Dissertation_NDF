@@ -48,9 +48,6 @@ __pycache__/
 data/model/
 vis_all/
 src/Python/Release/
-vg_tmp/
-
-
 # macOS
 .DS_Store
 
