@@ -2,6 +2,7 @@ import os, time, math, statistics
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 import ndf_py as _ndf
 import model_G
@@ -12,6 +13,47 @@ torch.set_num_threads(1)
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
+def _angles_to_grid(ang: torch.Tensor) -> torch.Tensor:
+    """
+    ang: (B,4) = [cosT, sinT, cosP, sinP]
+    return: grid for grid_sample, shape (B,1,1,2) in [-1,1]
+    """
+    cos_t, sin_t, cos_p, sin_p = ang[:,0], ang[:,1], ang[:,2], ang[:,3]
+    theta = torch.atan2(sin_t, cos_t)                     
+    phi   = torch.atan2(sin_p, cos_p)                      
+    phi   = torch.where(phi < 0, phi + 2*math.pi, phi)      
+
+    u = (phi / (2*math.pi)) * 2.0 - 1.0                     # x (W)
+    v = (theta / (math.pi/2)) * 2.0 - 1.0                   # y (H)
+    return torch.stack([u, v], dim=-1).view(-1, 1, 1, 2)
+
+class G1LUT2D(torch.nn.Module):
+    def __init__(self, lut: torch.Tensor):
+        super().__init__()
+        self.register_buffer("lut", lut)  # (1,1,H,W)
+
+    def forward(self, x260: torch.Tensor):
+        B = x260.shape[0]
+        ang = x260[:, :4]
+        grid = _angles_to_grid(ang).to(device=self.lut.device, dtype=self.lut.dtype)  
+        lut_b = self.lut.expand(B, -1, -1, -1).contiguous()
+        y = F.grid_sample(lut_b, grid, mode="bilinear",
+                          padding_mode="border", align_corners=False)
+        return y.view(-1, 1)
+
+
+
+def bake_lut_from_ndf(Dx_np, Dy_np, H=128, W=256):
+    theta = np.linspace(0, np.pi/2, H, endpoint=True, dtype=np.float32)
+    phi   = np.linspace(0, 2*np.pi,  W, endpoint=False, dtype=np.float32)
+    TT, PP = np.meshgrid(theta, phi, indexing="ij")
+    cos_t = np.cos(TT).reshape(-1,1); sin_t = np.sin(TT).reshape(-1,1)
+    cos_p = np.cos(PP).reshape(-1,1); sin_p = np.sin(PP).reshape(-1,1)
+    Dx = np.broadcast_to(Dx_np.reshape(1,-1), (H*W, 128))
+    Dy = np.broadcast_to(Dy_np.reshape(1,-1), (H*W, 128))
+    X  = np.concatenate([cos_t, sin_t, cos_p, sin_p, Dx, Dy], axis=1).astype(np.float32)
+    Y  = g1_traditional_eval(X).reshape(1,1,H,W)  
+    return torch.from_numpy(Y.copy())
 
 # ----------------------------- Utilities -----------------------------
 
@@ -675,7 +717,7 @@ def main():
             z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0))
         for z in [128,64,32,16,8,4,2,1,0]
     ]
-    
+    '''
     # ====== full model evaluation ======
     results_table = []  
     for name, ctor in MODEL_SPECS:
@@ -1041,6 +1083,59 @@ def main():
         pretty_print_agg(f"[HEAD-SEARCH]{tag} | CPU device-only fp32", device_cpu,
                          count_params(head_only), cpu_agg)
 
+ '''
+     # ====== G-LUT£¨CPU/GPU/fp32/fp16£©======
+    print("\n" + "="*80)
+    print(">>> G-LUT microbench (bilinear grid_sample) <<<")
+
+    Dx, Dy = _load_test_sample(sample_idx=7185)
+
+    LUT_SPECS = [
+        ("LUT_32x64_fp32",   32,  64,  torch.float32),
+        ("LUT_64x128_fp32",  64, 128,  torch.float32),
+        ("LUT_128x256_fp32", 128, 256, torch.float32),
+        ("LUT_256x512_fp32", 256, 512, torch.float32),
+        ("LUT_128x256_fp16", 128, 256, torch.float16),
+    ]
+
+    device_cpu = torch.device("cpu")
+    device_gpu = torch.device("cuda") if torch.cuda.is_available() else None
+    BATCH_GRID = (1, 2048)
+
+    for name, H, W, dt in LUT_SPECS:
+        lut = bake_lut_from_ndf(Dx, Dy, H=H, W=W)  # torch.float32 on CPU
+        lut = lut.to(device_cpu, dtype=dt)
+        m_cpu = G1LUT2D(lut)
+        params = 0
+
+        # CPU
+        cpu_agg = aggregate_bench_results([
+            run_benchmark(m_cpu, device_cpu, batch_sizes=BATCH_GRID,
+                          repeats=300, warmup=80, measure="device_only",
+                          use_amp=False, sample_source=sample_source)
+        ])
+        pretty_print_agg(f"{name} | CPU (device-only)", device_cpu, params, cpu_agg)
+
+        if device_gpu is not None:
+            # GPU fp32
+            m_gpu = G1LUT2D(lut.to(device_gpu, dtype=torch.float32))
+            gpu_agg = aggregate_bench_results([
+                run_benchmark(m_gpu, device_gpu, batch_sizes=BATCH_GRID,
+                              repeats=300, warmup=80, measure="device_only",
+                              use_amp=False, sample_source=sample_source)
+            ])
+            pretty_print_agg(f"{name} | GPU fp32 (device-only)", device_gpu, params, gpu_agg)
+
+            # GPU AMP(fp16)
+            m_gpu_fp16 = G1LUT2D(lut.to(device_gpu, dtype=torch.float16))
+            gpu_amp_agg = aggregate_bench_results([
+                run_benchmark(m_gpu_fp16, device_gpu, batch_sizes=BATCH_GRID,
+                              repeats=300, warmup=80, measure="device_only",
+                              use_amp=True, sample_source=sample_source)
+            ])
+            pretty_print_agg(f"{name} | GPU AMP(fp16) (device-only)", device_gpu, params, gpu_amp_agg)
+
+
 def render_case_full(model_name="Encoder_64", seed=0, sample_idx=0, out="vis_full"):
     npz = np.load("data/dataset/dataset_G_100k.npz")
     x, y = npz["x"], npz["y"]
@@ -1370,4 +1465,4 @@ def evaluate_truth_g1_lut(sample_idx=7185):
 if __name__ == "__main__":
     main()
     #visualize_all_models(sample_indices=(7185,), outdir="vis_all", W=512, H=256)
-    evaluate_truth_g1_lut(sample_idx=7185)
+    #evaluate_truth_g1_lut(sample_idx=7185)
