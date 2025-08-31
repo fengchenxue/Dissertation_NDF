@@ -1002,7 +1002,7 @@ def main():
         cpu_agg = aggregate_bench_results(cpu_runs)
         pretty_print_agg(f"[HEAD-ONLY] Encoder_{chosen_z} | CPU device-only fp32 (seeds={len(chosen_ckpts)})",
                          torch.device("cpu"), count_params(build_head_only_from_ckpt(chosen_ckpts[0], chosen_z)), cpu_agg)
-
+'''
 
   # ====== head-search evaluation (z=64) ======
     print("\n" + "="*80)
@@ -1083,8 +1083,58 @@ def main():
         pretty_print_agg(f"[HEAD-SEARCH]{tag} | CPU device-only fp32", device_cpu,
                          count_params(head_only), cpu_agg)
 
- '''
-     # ====== G-LUT£¨CPU/GPU/fp32/fp16£©======
+     # ---- GPU (fp32 / AMP(fp16) / split) ----
+    if device_gpu is not None:
+        # GPU fp32
+        gpu_runs = []
+        for s, p, cache in ckpts:
+            sample_src = make_head_sample_source(cache)
+            m_gpu = build_head_only_from_ckpt(
+                p, z_dim=64, head_hidden=hidden, act=act, dropout=dropout
+            ).to(device_gpu).eval()
+            r = run_benchmark(m_gpu, device_gpu,
+                              batch_sizes=(1, 2048), repeats=300, warmup=80,
+                              measure="device_only", use_amp=False,
+                              sample_source=sample_src)
+            gpu_runs.append(r)
+        gpu_agg = aggregate_bench_results(gpu_runs)
+        pretty_print_agg(f"[HEAD-SEARCH]{tag} | GPU device-only fp32",
+                         device_gpu, count_params(m_gpu), gpu_agg)
+
+        # GPU AMP(fp16)
+        gpu_amp_runs = []
+        for s, p, cache in ckpts:
+            sample_src = make_head_sample_source(cache)
+            m_gpu = build_head_only_from_ckpt(
+                p, z_dim=64, head_hidden=hidden, act=act, dropout=dropout
+            ).to(device_gpu).eval()
+            r = run_benchmark(m_gpu, device_gpu,
+                              batch_sizes=(1, 2048), repeats=300, warmup=80,
+                              measure="device_only", use_amp=True,
+                              sample_source=sample_src)
+            gpu_amp_runs.append(r)
+        gpu_amp_agg = aggregate_bench_results(gpu_amp_runs)
+        pretty_print_agg(f"[HEAD-SEARCH]{tag} | GPU device-only AMP(fp16)",
+                         device_gpu, count_params(m_gpu), gpu_amp_agg)
+
+        # GPU split(BS=1)
+        gpu_split_runs = []
+        for s, p, cache in ckpts:
+            sample_src = make_head_sample_source(cache)
+            m_gpu = build_head_only_from_ckpt(
+                p, z_dim=64, head_hidden=hidden, act=act, dropout=dropout
+            ).to(device_gpu).eval()
+            r = run_benchmark(m_gpu, device_gpu,
+                              batch_sizes=(1,), repeats=400, warmup=100,
+                              measure="split", use_amp=False,
+                              sample_source=sample_src)
+            gpu_split_runs.append(r)
+        gpu_split_agg = aggregate_bench_results(gpu_split_runs)
+        pretty_print_agg(f"[HEAD-SEARCH]{tag} | GPU split fp32 (BS=1)",
+                         device_gpu, count_params(m_gpu), gpu_split_agg)
+
+    '''
+     # ====== G-LUT(CPU/GPU/fp32/fp16)======
     print("\n" + "="*80)
     print(">>> G-LUT microbench (bilinear grid_sample) <<<")
 
@@ -1134,7 +1184,7 @@ def main():
                               use_amp=True, sample_source=sample_source)
             ])
             pretty_print_agg(f"{name} | GPU AMP(fp16) (device-only)", device_gpu, params, gpu_amp_agg)
-
+'''
 
 def render_case_full(model_name="Encoder_64", seed=0, sample_idx=0, out="vis_full"):
     npz = np.load("data/dataset/dataset_G_100k.npz")
