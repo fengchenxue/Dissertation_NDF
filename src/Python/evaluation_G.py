@@ -113,6 +113,68 @@ def parse_head_tag(tag: str):
     dropout = float(m.group("do"))
     return hidden, act, dropout
 
+def evaluate_g1_lut_accuracy(Dx_np, Dy_np, lut_11HW: torch.Tensor,
+                             H: int, W: int, high_theta_threshold: float = 1.2):
+
+    theta = np.linspace(0, np.pi/2, H, endpoint=True, dtype=np.float32)
+    phi   = np.linspace(0, 2*np.pi,  W, endpoint=False, dtype=np.float32)
+    TT, PP = np.meshgrid(theta, phi, indexing="ij")               
+    ANG = np.stack([np.cos(TT), np.sin(TT), np.cos(PP), np.sin(PP)],
+                   axis=-1).reshape(-1, 4).astype(np.float32)     
+
+
+    Dx = np.broadcast_to(Dx_np.reshape(1,-1), (H*W, 128))
+    Dy = np.broadcast_to(Dy_np.reshape(1,-1), (H*W, 128))
+    X260 = np.concatenate([ANG, Dx, Dy], axis=1).astype(np.float32)   
+    y_tr = g1_traditional_eval(X260).reshape(-1)                      
+
+ 
+    ANG_t = torch.from_numpy(ANG)
+    zpad  = torch.zeros((H*W, 256), dtype=ANG_t.dtype)           
+    x260  = torch.cat([ANG_t, zpad], dim=1)                          
+    m = G1LUT2D(lut_11HW.to("cpu"))                               
+    with torch.no_grad():
+        y_lut = m(x260).view(-1).numpy()
+
+    err  = np.abs(y_lut - y_tr)
+    mae  = float(err.mean())
+    rmse = float(np.sqrt(np.mean((y_lut - y_tr)**2)))
+    p95  = float(np.percentile(err, 95))
+    hi_mask = (TT.reshape(-1) >= high_theta_threshold)
+    hi_mae  = float(err[hi_mask].mean())
+    return {"MAE": mae, "RMSE": rmse, "P95": p95, "HighThetaMAE": hi_mae}
+
+def _metrics_from_errors(err: np.ndarray, theta: np.ndarray, high_theta_thr=1.2):
+    mae  = float(np.mean(err))
+    rmse = float(np.sqrt(np.mean(err**2)))
+    p95  = float(np.percentile(err, 95))
+    hi_mask = (theta >= high_theta_thr)
+    hi_mae  = float(np.mean(err[hi_mask])) if hi_mask.any() else float("nan")
+    return {"MAE": mae, "RMSE": rmse, "P95": p95, "HighTheta": hi_mae}
+
+def _metrics_mean_std_over_shards(err: np.ndarray, theta: np.ndarray,
+                                  k: int = 5, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    N   = err.shape[0]
+    idx = np.arange(N); rng.shuffle(idx)
+    shards = np.array_split(idx, k)
+
+    buckets = {"MAE":[], "RMSE":[], "P95":[], "HighTheta":[]}
+    for s in shards:
+        m = _metrics_from_errors(err[s], theta[s])
+        for k_ in buckets.keys():
+            buckets[k_].append(m[k_])
+
+    out = {}
+    for k_, vals in buckets.items():
+        vals = np.asarray(vals, dtype=np.float64)
+        out[k_] = {
+            "mean": float(vals.mean()),
+            "std":  float(vals.std(ddof=1)) if len(vals) > 1 else 0.0,
+            "n":    int(len(vals)),
+        }
+    return out
+
 # ---------- Traditional G1 (C++ via pybind) ----------
 
 def g1_traditional_eval(X_np):
@@ -690,6 +752,90 @@ def _compute_error_max_for_sample(Dx, Dy, full_ckpts, head_ckpts, device, W=256,
 
     return float(np.percentile(all_err, pctl))
 
+@torch.no_grad()
+def evaluate_glut_on_dataset_with_stats(x_test: np.ndarray,
+                                        lut_size=(128,256),
+                                        high_theta_thr=1.2,
+                                        k_shards=5, seed=42):
+    H, W = lut_size
+    ang  = x_test[:, :4].astype(np.float32)                    # (N,4)
+    Dx   = x_test[:, 4:4+128].astype(np.float32)
+    Dy   = x_test[:, 4+128:    ].astype(np.float32)
+
+
+    y_true = g1_traditional_eval(x_test).astype(np.float32).reshape(-1)
+
+    from collections import defaultdict
+    groups = defaultdict(list)   # key: bytes of Dx,Dy; val: indices list
+    for i in range(x_test.shape[0]):
+        key = (Dx[i].tobytes(), Dy[i].tobytes())
+        groups[key].append(i)
+
+    y_pred = np.empty_like(y_true)
+    for (dx_bytes, dy_bytes), idxs in groups.items():
+        dx = np.frombuffer(dx_bytes, dtype=np.float32, count=128)
+        dy = np.frombuffer(dy_bytes, dtype=np.float32, count=128)
+
+        lut = bake_lut_from_ndf(dx, dy, H=H, W=W)              # (1,1,H,W) torch.float32
+        sampler = G1LUT2D(lut.to("cpu")).eval()
+
+        ang_t   = torch.from_numpy(ang[idxs])
+        pad     = torch.zeros((len(idxs), 256), dtype=ang_t.dtype)  
+        x260    = torch.cat([ang_t, pad], dim=1)                    # (B,260)
+        y_pred[idxs] = sampler(x260).view(-1).numpy()
+
+
+    err   = np.abs(y_pred - y_true)
+    theta = np.arctan2(ang[:,1], ang[:,0])  
+
+
+    metrics_1shot = _metrics_from_errors(err, theta, high_theta_thr)
+    metrics_stat  = _metrics_mean_std_over_shards(err, theta, k=k_shards, seed=seed)
+
+    return metrics_1shot, metrics_stat
+# --- add: encoder bake benchmark (device-only) ---
+def benchmark_encoder_bake(encoder: nn.Module,
+                           device: torch.device,
+                           batch_sizes=(1, 2048),
+                           repeats=200,
+                           warmup=50,
+                           dtype=torch.float32):
+    """
+    Only run encoder(seq)->z to measure 'baking' time for head-only / head-search.
+    seq shape: (B, 2, 128). Returns {bs: {'mean_ms','p50_ms','p95_ms','throughput'}}.
+    """
+    import time, numpy as _np
+    encoder.eval().to(device)
+
+    def _one(bs: int) -> float:
+        seq = torch.randn(bs, 2, 128, dtype=dtype, device=device)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+            e0 = torch.cuda.Event(True); e1 = torch.cuda.Event(True)
+            e0.record(); _ = encoder(seq); e1.record()
+            torch.cuda.synchronize()
+            return e0.elapsed_time(e1)  # ms
+        else:
+            t0 = time.perf_counter(); _ = encoder(seq); t1 = time.perf_counter()
+            return (t1 - t0) * 1000.0
+
+    results = {}
+    # warmup
+    for bs in batch_sizes:
+        for _ in range(warmup):
+            _ = _one(bs)
+
+    # measure
+    for bs in batch_sizes:
+        times = [_one(bs) for _ in range(repeats)]
+        t = _np.array(times, dtype=_np.float64)
+        results[bs] = {
+            "mean_ms":   float(t.mean()),
+            "p50_ms":    float(_np.median(t)),
+            "p95_ms":    float(_np.percentile(t, 95)),
+            "throughput": float(bs / (t.mean()/1000.0)),   # samples / s
+        }
+    return results
 
 def main():
 
@@ -843,6 +989,7 @@ def main():
         print(", ".join([row[0], str(row[1])] + [f"{v:.6g}" if isinstance(v, float) else str(v) for v in row[2:]]))
     
 
+
     #====== head-only evaluation ======
     print("\n" + "=" * 80)
     print(">>> HEAD-ONLY evaluation (encoder offline; online path runs head only) <<<")
@@ -863,6 +1010,37 @@ def main():
         if not ckpts:
             print(f"[HEAD-ONLY][SKIP] {name}: no ckpt")
             continue
+        
+        #baking time
+        bake_cpu = []
+        for s, p in ckpts:
+            full = model_G.build_model(z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0).eval()
+            full.load_state_dict(torch.load(p, map_location=device_cpu), strict=True)
+            b = benchmark_encoder_bake(full.enc, device_cpu, batch_sizes=(1,2048), repeats=200, warmup=50)
+            bake_cpu.append(b)
+
+        def _agg_bake(per_seed, bs):
+            ms  = np.array([r[bs]['mean_ms']   for r in per_seed], dtype=np.float64)
+            thr = np.array([r[bs]['throughput'] for r in per_seed], dtype=np.float64)
+            return ms.mean(), (ms.std(ddof=1) if len(ms)>1 else 0.0), thr.mean(), (thr.std(ddof=1) if len(thr)>1 else 0.0)
+
+        b1_m,b1_s, t1_m,t1_s           = _agg_bake(bake_cpu, 1)
+        b2048_m,b2048_s, t2048_m,t2048_s = _agg_bake(bake_cpu, 2048)
+        print(f"[BAKE][{name}] CPU  b1={b1_m:.3f}+/-{b1_s:.3f} ms  "
+              f"b2048={b2048_m:.3f}+/-{b2048_s:.3f} ms  thr={t2048_m:.0f}+/-{t2048_s:.0f}/s")
+
+
+        if device_gpu is not None:
+            bake_gpu = []
+            for s, p in ckpts:
+                full = model_G.build_model(z_dim=z, head_hidden=(128,64), act="relu", dropout=0.0).eval()
+                full.load_state_dict(torch.load(p, map_location=device_gpu), strict=True)
+                b = benchmark_encoder_bake(full.enc, device_gpu, batch_sizes=(1,2048), repeats=200, warmup=50)
+                bake_gpu.append(b)
+            b1_m,b1_s, t1_m,t1_s           = _agg_bake(bake_gpu, 1)
+            b2048_m,b2048_s, t2048_m,t2048_s = _agg_bake(bake_gpu, 2048)
+            print(f"[BAKE][{name}] GPU  b1={b1_m:.3f}+/-{b1_s:.3f} ms  "
+                  f"b2048={b2048_m:.3f}+/-{b2048_s:.3f} ms  thr={t2048_m:.0f}+/-{t2048_s:.0f}/s")
 
         # Precompute z-cache per seed
         caches = []
@@ -962,6 +1140,7 @@ def main():
             gpu_split_agg = aggregate_bench_results(gpu_split_runs)
             pretty_print_agg(f"[HEAD-ONLY]{name} | GPU split fp32 (BS=1, seeds={len(caches)})", device_gpu, params_ref, gpu_split_agg)
 
+   
  # ----- Traditional G1 CPU benchmark (fair CPU-vs-CPU) -----
     print("\n" + "="*80)
     print(">>> Traditional G1 (C++ via pybind) vs head-only (CPU) <<<")
@@ -1002,8 +1181,8 @@ def main():
         cpu_agg = aggregate_bench_results(cpu_runs)
         pretty_print_agg(f"[HEAD-ONLY] Encoder_{chosen_z} | CPU device-only fp32 (seeds={len(chosen_ckpts)})",
                          torch.device("cpu"), count_params(build_head_only_from_ckpt(chosen_ckpts[0], chosen_z)), cpu_agg)
-'''
 
+'''
   # ====== head-search evaluation (z=64) ======
     print("\n" + "="*80)
     print(">>> HEAD-SEARCH (z=64) evaluation on test split <<<")
@@ -1084,23 +1263,24 @@ def main():
                          count_params(head_only), cpu_agg)
 
      # ---- GPU (fp32 / AMP(fp16) / split) ----
-    if device_gpu is not None:
-        # GPU fp32
-        gpu_runs = []
-        for s, p, cache in ckpts:
-            sample_src = make_head_sample_source(cache)
-            m_gpu = build_head_only_from_ckpt(
-                p, z_dim=64, head_hidden=hidden, act=act, dropout=dropout
-            ).to(device_gpu).eval()
-            r = run_benchmark(m_gpu, device_gpu,
-                              batch_sizes=(1, 2048), repeats=300, warmup=80,
-                              measure="device_only", use_amp=False,
-                              sample_source=sample_src)
-            gpu_runs.append(r)
-        gpu_agg = aggregate_bench_results(gpu_runs)
-        pretty_print_agg(f"[HEAD-SEARCH]{tag} | GPU device-only fp32",
-                         device_gpu, count_params(m_gpu), gpu_agg)
+        if device_gpu is not None:
+            # GPU fp32
+            gpu_runs = []
+            for s, p, cache in ckpts:
+                sample_src = make_head_sample_source(cache)
+                m_gpu = build_head_only_from_ckpt(
+                    p, z_dim=64, head_hidden=hidden, act=act, dropout=dropout
+                ).to(device_gpu).eval()
+                r = run_benchmark(m_gpu, device_gpu,
+                                  batch_sizes=(1, 2048), repeats=300, warmup=80,
+                                  measure="device_only", use_amp=False,
+                                  sample_source=sample_src)
+                gpu_runs.append(r)
+            gpu_agg = aggregate_bench_results(gpu_runs)
+            pretty_print_agg(f"[HEAD-SEARCH]{tag} | GPU device-only fp32",
+                             device_gpu, count_params(m_gpu), gpu_agg)
 
+        '''
         # GPU AMP(fp16)
         gpu_amp_runs = []
         for s, p, cache in ckpts:
@@ -1132,6 +1312,7 @@ def main():
         gpu_split_agg = aggregate_bench_results(gpu_split_runs)
         pretty_print_agg(f"[HEAD-SEARCH]{tag} | GPU split fp32 (BS=1)",
                          device_gpu, count_params(m_gpu), gpu_split_agg)
+    '''
 
     '''
      # ====== G-LUT(CPU/GPU/fp32/fp16)======
@@ -1154,16 +1335,24 @@ def main():
 
     for name, H, W, dt in LUT_SPECS:
         lut = bake_lut_from_ndf(Dx, Dy, H=H, W=W)  # torch.float32 on CPU
+        
+        one, stat = evaluate_glut_on_dataset_with_stats(x_te, lut_size=(H,W), high_theta_thr=1.2, k_shards=5, seed=42)
+        print(f"{name} | ACC(single)  MAE={one['MAE']:.6f}  RMSE={one['RMSE']:.6f}  "
+              f"P95={one['P95']:.6f}  HighTheta={one['HighTheta']:.6f}")
+        print(f"{name} | ACC(mean+-std over shards, k={stat['MAE']['n']})  "
+              f"MAE={stat['MAE']['mean']:.6f}+-{stat['MAE']['std']:.6f}  "
+              f"RMSE={stat['RMSE']['mean']:.6f}+-{stat['RMSE']['std']:.6f}  "
+              f"P95={stat['P95']['mean']:.6f}+-{stat['P95']['std']:.6f}  "
+              f"HighTheta={stat['HighTheta']['mean']:.6f}+-{stat['HighTheta']['std']:.6f}")
+
         lut = lut.to(device_cpu, dtype=dt)
         m_cpu = G1LUT2D(lut)
         params = 0
 
         # CPU
-        cpu_agg = aggregate_bench_results([
-            run_benchmark(m_cpu, device_cpu, batch_sizes=BATCH_GRID,
+        cpu_agg = aggregate_bench_results([run_benchmark(m_cpu, device_cpu, batch_sizes=BATCH_GRID,
                           repeats=300, warmup=80, measure="device_only",
-                          use_amp=False, sample_source=sample_source)
-        ])
+                          use_amp=False, sample_source=sample_source)])
         pretty_print_agg(f"{name} | CPU (device-only)", device_cpu, params, cpu_agg)
 
         if device_gpu is not None:
@@ -1512,7 +1701,95 @@ def evaluate_truth_g1_lut(sample_idx=7185):
         for bs, s in bmk.items():
             print(f"             sample bs={bs:<4d} mean={s['mean']:.4f}ms p50={s['p50']:.4f} p95={s['p95']:.4f} thr={s['throughput']:.0f}/s")
 
+def time_truth_g1_bake_once(
+    Dx, Dy, Ntheta, Nphi, fp16=True, include_setup=False, phi_period=2*math.pi
+):
+    """
+    One-shot bake timing (seconds) for the traditional G1 LUT.
+    include_setup=False: time only the core compute (g1_traditional_eval).
+    Returns: (elapsed_sec, lut, theta_vals, phi_vals)
+    """
+    if include_setup:
+        t0 = time.perf_counter()
+
+    # Angle grid: shape (Ntheta, Nphi)
+    cos_t = np.linspace(1.0, 0.0, Ntheta, dtype=np.float32)
+    theta_vals = np.arccos(np.clip(cos_t, 0.0, 1.0))
+    phi_vals   = np.linspace(0.0, phi_period, Nphi, endpoint=False, dtype=np.float32)
+
+    TT, PP = np.meshgrid(theta_vals, phi_vals, indexing="ij")
+    ANG = np.stack([np.cos(TT), np.sin(TT), np.cos(PP), np.sin(PP)], axis=-1) \
+           .reshape(-1, 4).astype(np.float32)
+
+    Dx_t = np.broadcast_to(Dx.reshape(1, -1), (ANG.shape[0], 128))
+    Dy_t = np.broadcast_to(Dy.reshape(1, -1), (ANG.shape[0], 128))
+    X260 = np.concatenate([ANG, Dx_t, Dy_t], axis=1).astype(np.float32)
+
+    if not include_setup:
+        t0 = time.perf_counter()
+
+    y = g1_traditional_eval(X260).reshape(Ntheta, Nphi)
+    lut = y.astype(np.float16) if fp16 else y.astype(np.float32)
+
+    t1 = time.perf_counter()
+    return (t1 - t0), lut, theta_vals.astype(np.float32), phi_vals.astype(np.float32)
+
+
+def evaluate_truth_g1_lut_avg(
+    sample_idx=7185,
+    grids=((64,128), (128,64), (256,128)),  # (Ntheta, Nphi)
+    repeats=30,
+    warmup=5,
+    fp16=True,
+    include_setup=False,
+    eval_W=512,
+    eval_H=256,
+):
+    """
+    Prints: LUT size (KiB), bake mean+/-std (ms), accuracy, and sampling benchmarks (bs=1,2048).
+    Ntheta x Nphi matches meshgrid(indexing="ij"): array shape is (Ntheta, Nphi).
+    """
+    Dx, Dy = _load_test_sample(sample_idx=sample_idx)
+
+    for (Ntheta, Nphi) in grids:
+        # warmup
+        for _ in range(warmup):
+            _ = time_truth_g1_bake_once(Dx, Dy, Ntheta, Nphi, fp16=fp16, include_setup=include_setup)[0]
+
+        # measure
+        t_list = []
+        last = None
+        for _ in range(repeats):
+            t, lut, thv, phv = time_truth_g1_bake_once(Dx, Dy, Ntheta, Nphi, fp16=fp16, include_setup=include_setup)
+            t_list.append(t); last = (lut, thv, phv)
+
+        t_arr = np.asarray(t_list, dtype=np.float64)
+        mean_ms = t_arr.mean() * 1000.0
+        std_ms  = (t_arr.std(ddof=1) * 1000.0) if repeats > 1 else 0.0
+
+        lut, thv, phv = last
+        acc = evaluate_g1_lut_against_traditional(Dx, Dy, lut, thv, phv, W=eval_W, H=eval_H)
+        bmk = benchmark_lut_sampling(lut, thv, phv, bs_list=(1, 2048))
+
+        kib = lut.size * (2 if lut.dtype == np.float16 else 4) / 1024.0
+        print(
+            f"[Truth G-LUT] NthetaxNphi={Ntheta}x{Nphi}  size={kib:.1f} KiB  "
+            f"bake(mean_std)={mean_ms:.2f}+/-{std_ms:.2f} ms  "
+            f"| MAE={acc['MAE']:.5f}  P95={acc['P95']:.5f}  HighTheta={acc['HighThetaMAE']:.5f}"
+        )
+        for bs, s in bmk.items():
+            print(
+                f"               sample bs={bs:<4d} mean={s['mean']:.4f} ms  "
+                f"p50={s['p50']:.4f}  p95={s['p95']:.4f}  thr={s['throughput']:.0f}/s"
+            )
 if __name__ == "__main__":
     main()
     #visualize_all_models(sample_indices=(7185,), outdir="vis_all", W=512, H=256)
     #evaluate_truth_g1_lut(sample_idx=7185)
+    '''
+    evaluate_truth_g1_lut_avg(
+    sample_idx=7185,
+    grids=((64,64), (64,128), (128,64), (256,128)),  # Ntheta x Nphi
+    repeats=200, warmup=50, fp16=False, include_setup=False
+)
+    '''
